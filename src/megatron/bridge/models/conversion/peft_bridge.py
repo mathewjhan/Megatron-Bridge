@@ -621,6 +621,16 @@ class MegatronPeftBridge:
 
             linear_in_tensor = adapter_weight.linear_in_weight.weight
             linear_out_tensor = adapter_weight.linear_out_weight.weight
+
+            ##############################
+            ###########lora###############
+            ##############################
+            megatron_linear_in_name = adapter_weight.linear_in_weight.param_name
+            megatron_linear_out_name = adapter_weight.linear_out_weight.param_name
+            ##############################
+            ##############################
+            ##############################
+            
             is_expert = is_expert_linear(adapter_task.global_base_prefix)
             is_grouped_expert = is_expert and ".local_experts." not in adapter_task.global_base_prefix
             expert_linear_in_gathered = None
@@ -690,8 +700,8 @@ class MegatronPeftBridge:
                             # yield HFWeightTuple(linear_in_hf_names[index], current_linear_in_tensor)
                             # yield HFWeightTuple(linear_out_hf_names[index], current_linear_out_tensor)
 
-                            yield HFWeightTuple(linear_in_hf_names[index], current_linear_in_tensor, None)
-                            yield HFWeightTuple(linear_out_hf_names[index], current_linear_out_tensor, None)
+                            yield HFWeightTuple(linear_in_hf_names[index], current_linear_in_tensor, megatron_linear_in_name)
+                            yield HFWeightTuple(linear_out_hf_names[index], current_linear_out_tensor, megatron_linear_out_name)
                             ##############################
                             ##############################
                             ##############################
@@ -703,8 +713,8 @@ class MegatronPeftBridge:
                 # yield HFWeightTuple(linear_in_hf_names[0], current_linear_in_tensor)
                 # yield HFWeightTuple(linear_out_hf_names[0], current_linear_out_tensor)
 
-                yield HFWeightTuple(linear_in_hf_names[0], current_linear_in_tensor, None)
-                yield HFWeightTuple(linear_out_hf_names[0], current_linear_out_tensor, None)
+                yield HFWeightTuple(linear_in_hf_names[0], current_linear_in_tensor, megatron_linear_in_name)
+                yield HFWeightTuple(linear_out_hf_names[0], current_linear_out_tensor, megatron_linear_out_name)
                 ##############################
                 ##############################
                 ##############################
