@@ -96,3 +96,29 @@ class TestQwen3VLUtils:
 
         assert position_ids.shape == (3, batch_size, seq_len)
         assert deltas.shape == (batch_size, 1)
+
+    def test_get_rope_index_with_packed_seq_params(self):
+        """Test get_rope_index builds attention_mask from packed_seq_params."""
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        seq_len = 8
+        input_ids = torch.randint(0, 1000, (2, seq_len))
+        cu_seqlens = torch.tensor([0, 5, 8], dtype=torch.int32)
+
+        packed = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            qkv_format="thd",
+        )
+
+        position_ids, deltas = get_rope_index(
+            spatial_merge_size=2,
+            image_token_id=151655,
+            video_token_id=151656,
+            vision_start_token_id=151652,
+            input_ids=input_ids,
+            packed_seq_params=packed,
+        )
+
+        assert position_ids.shape == (3, 2, seq_len)
+        assert deltas.shape == (2, 1)
