@@ -90,7 +90,7 @@ class Qwen3VLBridge(MegatronModelBridge):
             layernorm_epsilon=text_config.rms_norm_eps,
             gated_linear_unit=True,  # Qwen3 uses gated linear units
             make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(text_config.vocab_size),
-            rotary_base=text_config.rope_theta,
+            rotary_base=text_config.rope_parameters["rope_theta"],
             share_embeddings_and_output_weights=getattr(text_config, "tie_word_embeddings", False),
             vocab_size=text_config.vocab_size,
             seq_length=text_config.max_position_embeddings,

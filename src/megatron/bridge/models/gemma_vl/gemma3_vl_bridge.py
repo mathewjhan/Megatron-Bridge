@@ -52,7 +52,7 @@ class Gemma3VLBridge(MegatronModelBridge):
             num_layers=text_config.num_hidden_layers,
             num_query_groups=text_config.num_key_value_heads,
             window_size=text_config.sliding_window,
-            rotary_base=(text_config.rope_local_base_freq, text_config.rope_theta),
+            rotary_base=(text_config.rope_local_base_freq, text_config.rope_parameters["rope_theta"]),
             layernorm_epsilon=text_config.rms_norm_eps,
             vocab_size=text_config.vocab_size,
             softmax_scale=1.0 / math.sqrt(text_config.query_pre_attn_scalar),
