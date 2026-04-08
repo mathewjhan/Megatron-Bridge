@@ -12,14 +12,14 @@ from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear
 from megatron.bridge.peft.multi_lora_state import set_lora_num_tokens, reset_state
 
 N_ADAPTERS = 3
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
 
 
 def main():
     print(f"Loading {MODEL_NAME}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        MODEL_NAME, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map="auto",
     )
     model.eval()
 
@@ -48,7 +48,7 @@ def main():
     # Test forward with mixed adapters
     print("\n--- Forward test (mixed adapters) ---")
     text = "The quick brown fox"
-    inputs = tokenizer(text, return_tensors="pt")
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
     seq_len = inputs["input_ids"].shape[1]
 
     n0, n1, n2 = 2, seq_len - 2, 0
