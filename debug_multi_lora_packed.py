@@ -57,58 +57,81 @@ def main():
     print(f"\nSeq A (adapter 0): '{text_a}' ({len_a} tokens)")
     print(f"Seq B (adapter 1): '{text_b}' ({len_b} tokens)")
 
-    # --- Packed forward ---
-    print("\n--- Packed forward (both sequences, different adapters) ---")
+    # --- Autoregressive generation: packed vs solo ---
+    num_steps = 20
 
-    # Concatenate tokens: [seq_a..., seq_b...]
-    packed_ids = torch.tensor([ids_a + ids_b], device="cuda")  # [1, total]
+    # Generate with each sequence solo
+    print(f"\n--- Solo generation ({num_steps} steps) ---")
 
-    # Position ids: reset for each sequence
-    position_ids = torch.cat([
-        torch.arange(len_a),
-        torch.arange(len_b),
-    ]).unsqueeze(0).cuda()  # [1, total]
+    gen_a = list(ids_a)
+    gen_b = list(ids_b)
 
-    # cu_seqlens for flash attention varlen
-    cu_seqlens = torch.tensor([0, len_a, total], dtype=torch.int32, device="cuda")
+    for step in range(num_steps):
+        # Seq A with adapter 0
+        set_lora_num_tokens(torch.tensor([len(gen_a), 0], dtype=torch.int32), reset_reference=True)
+        with torch.no_grad():
+            out_a = model(input_ids=torch.tensor([gen_a], device="cuda"))
+        next_a = out_a.logits[0, -1].argmax().item()
+        gen_a.append(next_a)
 
-    # lora_num_tokens: adapter 0 gets len_a tokens, adapter 1 gets len_b
-    set_lora_num_tokens(torch.tensor([len_a, len_b], dtype=torch.int32), reset_reference=True)
+        # Seq B with adapter 1
+        set_lora_num_tokens(torch.tensor([0, len(gen_b)], dtype=torch.int32), reset_reference=True)
+        with torch.no_grad():
+            out_b = model(input_ids=torch.tensor([gen_b], device="cuda"))
+        next_b = out_b.logits[0, -1].argmax().item()
+        gen_b.append(next_b)
 
-    with torch.no_grad():
-        packed_out = model(
-            input_ids=packed_ids,
-            position_ids=position_ids,
-            cache_position=torch.arange(total, device="cuda"),
-        )
+    decoded_a = tokenizer.decode(gen_a)
+    decoded_b = tokenizer.decode(gen_b)
+    print(f"Seq A (adapter 0): {decoded_a}")
+    print(f"Seq B (adapter 1): {decoded_b}")
 
-    logits = packed_out.logits[0]  # [total, vocab]
-    next_a = tokenizer.decode(logits[len_a - 1].argmax())
-    next_b = tokenizer.decode(logits[total - 1].argmax())
-    print(f"Seq A next token (adapter 0): '{next_a}'")
-    print(f"Seq B next token (adapter 1): '{next_b}'")
+    # Generate with packed sequences
+    print(f"\n--- Packed generation ({num_steps} steps) ---")
 
-    # --- Unpacked forward for comparison ---
-    print("\n--- Unpacked forward (each sequence separately) ---")
+    packed_a = list(ids_a)
+    packed_b = list(ids_b)
 
-    # Seq A alone with adapter 0
-    set_lora_num_tokens(torch.tensor([len_a, 0], dtype=torch.int32))
-    with torch.no_grad():
-        out_a = model(input_ids=torch.tensor([ids_a], device="cuda"))
-    next_a_solo = tokenizer.decode(out_a.logits[0, -1].argmax())
-    print(f"Seq A solo next token (adapter 0): '{next_a_solo}'")
+    for step in range(num_steps):
+        total = len(packed_a) + len(packed_b)
+        packed_ids = torch.tensor([packed_a + packed_b], device="cuda")
+        position_ids = torch.cat([
+            torch.arange(len(packed_a)),
+            torch.arange(len(packed_b)),
+        ]).unsqueeze(0).cuda()
 
-    # Seq B alone with adapter 1
-    set_lora_num_tokens(torch.tensor([0, len_b], dtype=torch.int32))
-    with torch.no_grad():
-        out_b = model(input_ids=torch.tensor([ids_b], device="cuda"))
-    next_b_solo = tokenizer.decode(out_b.logits[0, -1].argmax())
-    print(f"Seq B solo next token (adapter 1): '{next_b_solo}'")
+        set_lora_num_tokens(torch.tensor([len(packed_a), len(packed_b)], dtype=torch.int32), reset_reference=True)
+
+        with torch.no_grad():
+            packed_out = model(
+                input_ids=packed_ids,
+                position_ids=position_ids,
+                cache_position=torch.arange(total, device="cuda"),
+            )
+
+        logits = packed_out.logits[0]
+        next_a = logits[len(packed_a) - 1].argmax().item()
+        next_b = logits[total - 1].argmax().item()
+        packed_a.append(next_a)
+        packed_b.append(next_b)
+
+    decoded_packed_a = tokenizer.decode(packed_a)
+    decoded_packed_b = tokenizer.decode(packed_b)
+    print(f"Seq A (adapter 0): {decoded_packed_a}")
+    print(f"Seq B (adapter 1): {decoded_packed_b}")
 
     # Compare
-    print("\n--- Comparison ---")
-    print(f"Seq A packed vs solo: '{next_a}' vs '{next_a_solo}' {'✓ match' if next_a == next_a_solo else '✗ MISMATCH'}")
-    print(f"Seq B packed vs solo: '{next_b}' vs '{next_b_solo}' {'✓ match' if next_b == next_b_solo else '✗ MISMATCH'}")
+    print(f"\n--- Comparison ---")
+    match_a = decoded_a == decoded_packed_a
+    match_b = decoded_b == decoded_packed_b
+    print(f"Seq A: {'✓ match' if match_a else '✗ MISMATCH'}")
+    if not match_a:
+        print(f"  Solo:   {decoded_a}")
+        print(f"  Packed: {decoded_packed_a}")
+    print(f"Seq B: {'✓ match' if match_b else '✗ MISMATCH'}")
+    if not match_b:
+        print(f"  Solo:   {decoded_b}")
+        print(f"  Packed: {decoded_packed_b}")
 
     reset_state()
     print("\nDone!")
