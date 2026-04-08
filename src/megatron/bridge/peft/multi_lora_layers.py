@@ -26,13 +26,81 @@ Two forward implementations are provided:
   for a single fused kernel.  Requires manual TP/SP handling.  Experimental.
 """
 
-from typing import Any, Dict, Iterator, Optional, Tuple
+import math
+from typing import Any, Dict, Iterator, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.peft.multi_lora_state import get_lora_num_tokens
+
+
+class SimpleLoRAAdapter(nn.Module):
+    """Lightweight LoRA adapter for plain ``nn.Linear`` modules.
+
+    Holds a ``linear_in`` (A) and ``linear_out`` (B) pair with scaling.
+    Unlike :class:`ParallelLinearAdapter`, this has no TP/SP communication.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        dim: int = 16,
+        alpha: float = 32.0,
+        dropout: float = 0.0,
+        dropout_position: Literal["pre", "post"] = "pre",
+        lora_A_init_method: str = "xavier",
+        lora_dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.alpha = alpha
+
+        dtype = lora_dtype
+        self.linear_in = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
+        self.linear_out = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
+
+        self._init_weights(lora_A_init_method)
+
+        if dropout > 0.0:
+            self.dropout = nn.Dropout(p=dropout)
+        else:
+            self.dropout = nn.Identity()
+        self.dropout_position = dropout_position
+
+    def _init_weights(self, lora_A_init_method: str) -> None:
+        if lora_A_init_method == "xavier":
+            nn.init.xavier_normal_(self.linear_in.weight.data)
+        elif lora_A_init_method == "kaiming":
+            nn.init.kaiming_uniform_(self.linear_in.weight.data, a=math.sqrt(5))
+        else:
+            nn.init.xavier_normal_(self.linear_in.weight.data)
+        nn.init.zeros_(self.linear_out.weight.data)
+
+    def _get_init_fn(self, init_method: str):
+        if init_method == "xavier":
+            return nn.init.xavier_normal_
+        elif init_method == "kaiming":
+            from megatron.bridge.peft.utils import init_method_kaiming_uniform
+            return init_method_kaiming_uniform(math.sqrt(5))
+        elif init_method == "zero":
+            return lambda t: nn.init.constant_(t, 0.0)
+        elif init_method == "normal":
+            from megatron.bridge.peft.utils import init_method_normal
+            return init_method_normal(0.2)
+        raise NotImplementedError(f"Unknown init method: {init_method}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.dropout_position == "pre":
+            x = self.dropout(x)
+        out = self.linear_out(self.linear_in(x))
+        out = out * (self.alpha / self.dim)
+        if self.dropout_position == "post":
+            out = self.dropout(out)
+        return out
 
 
 class MultiLoRALinear(AdapterWrapper):

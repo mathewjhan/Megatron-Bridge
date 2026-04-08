@@ -43,7 +43,7 @@ from megatron.core.transformer.moe.router import TopKRouter
 
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear
+from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleLoRAAdapter
 from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear, is_expert_linear
 
 logger = logging.getLogger(__name__)
@@ -94,17 +94,6 @@ class MultiLoRA(PEFT, ModuleMatcher):
         if isinstance(module, MultiLoRALinear):
             return module
 
-        # Only handle Megatron parallel linears — skip plain nn.Linear / te.Linear
-        if isinstance(module, nn.Linear):
-            return module
-        try:
-            import transformer_engine.pytorch as te
-
-            if module.__class__ == te.Linear:
-                return module
-        except ImportError:
-            pass
-
         if (ans := self.match(module, name, prefix)) is not None:
             (match, full_name) = ans
 
@@ -116,8 +105,35 @@ class MultiLoRA(PEFT, ModuleMatcher):
             if isinstance(module, TopKRouter):
                 return module
 
-            attrs = get_adapter_attributes_from_linear(module)
+            # --- Plain nn.Linear (HF models) ---
+            if isinstance(module, nn.Linear):
+                logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to nn.Linear: {full_name}")
+                wrapper = _TupleLinearWrapper(module)
+                adapters = nn.ModuleList([
+                    SimpleLoRAAdapter(
+                        module.in_features,
+                        module.out_features,
+                        dim=self.dim,
+                        alpha=self.alpha,
+                        dropout=self.dropout,
+                        dropout_position=self.dropout_position,
+                        lora_A_init_method=self.lora_A_init_method,
+                        lora_dtype=self.lora_dtype or module.weight.dtype,
+                        device=module.weight.device,
+                    )
+                    for _ in range(self.n_adapters)
+                ])
+                return MultiLoRALinear(
+                    wrapper,
+                    adapters,
+                    self.n_adapters,
+                    use_grouped_mm=self.use_grouped_mm,
+                    column_init_method=self.lora_A_init_method,
+                    row_init_method="zero",
+                )
 
+            # --- Megatron parallel linears ---
+            attrs = get_adapter_attributes_from_linear(module)
             logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to: {full_name}")
 
             adapters = nn.ModuleList()
@@ -225,3 +241,18 @@ class MultiLoRA(PEFT, ModuleMatcher):
             for name, module in model_chunk.named_modules():
                 if isinstance(module, MultiLoRALinear):
                     yield name, module
+
+
+class _TupleLinearWrapper(nn.Module):
+    """Wraps an ``nn.Linear`` to return ``(output, bias)`` tuples like Megatron linears.
+
+    This allows :class:`MultiLoRALinear` (which inherits
+    :meth:`AdapterWrapper.base_linear_forward`) to work with plain HF models.
+    """
+
+    def __init__(self, linear: nn.Linear) -> None:
+        super().__init__()
+        self.linear = linear
+
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> Tuple[torch.Tensor, None]:
+        return self.linear(x), None
