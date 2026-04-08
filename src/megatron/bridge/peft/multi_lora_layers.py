@@ -169,14 +169,14 @@ class MultiLoRALinear(AdapterWrapper):
         """Run each adapter on its token slice. TP/SP-safe by construction.
 
         Args:
-            x: Input tensor, shape ``[total_tokens, features]`` or
-               ``[batch, seq_len, features]``.
+            x: Input tensor, shape ``[total_tokens, in_features]`` or
+               ``[batch, seq_len, in_features]``.
             lora_num_tokens: Token counts per adapter, shape ``[n_adapters]``.
 
         Returns:
-            Combined adapter output, same shape as *x*.
+            Combined adapter output with shape ``[total_tokens, out_features]``.
+            The caller (``forward``) reshapes to match ``linear_output``.
         """
-        ori_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
         offsets = lora_num_tokens.cumsum(dim=0)
         total = offsets[-1].item()
@@ -188,8 +188,7 @@ class MultiLoRALinear(AdapterWrapper):
         prev = 0
         for i in range(self.n_adapters):
             cur = offsets[i].item()
-            n_tokens = cur - prev
-            if n_tokens == 0:
+            if cur == prev:
                 prev = cur
                 continue
 
@@ -206,9 +205,9 @@ class MultiLoRALinear(AdapterWrapper):
             prev = cur
 
         if not adapter_outputs:
-            return torch.zeros_like(x_flat).reshape(ori_shape)
+            return x_flat.new_zeros(x_flat.shape[0], self.adapters[0].linear_out.out_features)
 
-        return torch.cat(adapter_outputs, dim=0).reshape(ori_shape)
+        return torch.cat(adapter_outputs, dim=0)
 
     def _forward_grouped_mm(
         self, x: torch.Tensor, lora_num_tokens: torch.Tensor
@@ -222,20 +221,18 @@ class MultiLoRALinear(AdapterWrapper):
             correctly, or when running without tensor/sequence parallelism.
 
         Args:
-            x: Input tensor, shape ``[total_tokens, features]`` or
-               ``[batch, seq_len, features]``.
+            x: Input tensor, shape ``[total_tokens, in_features]`` or
+               ``[batch, seq_len, in_features]``.
             lora_num_tokens: Token counts per adapter, shape ``[n_adapters]``.
 
         Returns:
-            Combined adapter output, same shape as *x*.
+            Combined adapter output with shape ``[total_tokens, out_features]``.
+            The caller (``forward``) reshapes to match ``linear_output``.
         """
-        ori_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
         offsets = lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
 
         # Stack raw weight tensors from all adapters
-        # linear_in.weight: [dim_local, in_features_local] (may be TP-sharded)
-        # linear_out.weight: [out_features_local, dim] (may be TP-sharded)
         stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
         stacked_B = torch.stack([a.linear_out.weight for a in self.adapters])
 
@@ -248,7 +245,7 @@ class MultiLoRALinear(AdapterWrapper):
         per_token_scaling = torch.repeat_interleave(scaling_tensor, lora_num_tokens).unsqueeze(-1)
         out = out * per_token_scaling
 
-        return out.reshape(ori_shape)
+        return out
 
     # ------------------------------------------------------------------
     # Per-adapter lifecycle
