@@ -8,7 +8,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from megatron.bridge.peft.multi_lora import MultiLoRA
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear
+from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleMultiLoRALinear
 from megatron.bridge.peft.multi_lora_state import set_lora_num_tokens, reset_state
 
 N_ADAPTERS = 3
@@ -39,7 +39,7 @@ def main():
     total_params_after = sum(p.numel() for p in model.parameters())
     adapter_params = total_params_after - total_params_before
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    wrapped = sum(1 for m in model.modules() if isinstance(m, MultiLoRALinear))
+    wrapped = sum(1 for m in model.modules() if isinstance(m, (MultiLoRALinear, SimpleMultiLoRALinear)))
     print(f"Wrapped {wrapped} modules")
     print(f"Total params after: {total_params_after:,}")
     print(f"Adapter params: {adapter_params:,} ({N_ADAPTERS} adapters x {adapter_params // N_ADAPTERS:,} each)")
