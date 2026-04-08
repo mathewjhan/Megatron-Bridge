@@ -58,15 +58,17 @@ def main():
 
     with torch.no_grad():
         outputs = model(**inputs)
+    next_token = outputs.logits[0, -1].argmax()
     print(f"Output logits shape: {outputs.logits.shape}")
-    print(f"Output logits sample: {outputs.logits[0, -1, :5]}")
+    print(f"Next token: '{tokenizer.decode(next_token)}'")
 
     # Test single adapter
     print("\n--- Forward test (single adapter 2) ---")
     set_lora_num_tokens(torch.tensor([0, 0, seq_len], dtype=torch.int32))
     with torch.no_grad():
         outputs2 = model(**inputs)
-    print(f"Output logits sample: {outputs2.logits[0, -1, :5]}")
+    next_token2 = outputs2.logits[0, -1].argmax()
+    print(f"Next token: '{tokenizer.decode(next_token2)}'")
 
     # Test reset
     print("\n--- Reset adapter 1 ---")
