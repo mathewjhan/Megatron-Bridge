@@ -43,7 +43,7 @@ from megatron.core.transformer.moe.router import TopKRouter
 
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleLoRAAdapter
+from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleMultiLoRALinear
 from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear, is_expert_linear
 
 logger = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
         # Skip already transformed modules
-        if isinstance(module, MultiLoRALinear):
+        if isinstance(module, (MultiLoRALinear, SimpleMultiLoRALinear)):
             return module
 
         if (ans := self.match(module, name, prefix)) is not None:
@@ -108,28 +108,15 @@ class MultiLoRA(PEFT, ModuleMatcher):
             # --- Plain nn.Linear (HF models) ---
             if isinstance(module, nn.Linear):
                 logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to nn.Linear: {full_name}")
-                wrapper = _TupleLinearWrapper(module)
-                adapters = nn.ModuleList([
-                    SimpleLoRAAdapter(
-                        module.in_features,
-                        module.out_features,
-                        dim=self.dim,
-                        alpha=self.alpha,
-                        dropout=self.dropout,
-                        dropout_position=self.dropout_position,
-                        lora_A_init_method=self.lora_A_init_method,
-                        lora_dtype=self.lora_dtype or module.weight.dtype,
-                        device=module.weight.device,
-                    )
-                    for _ in range(self.n_adapters)
-                ])
-                return MultiLoRALinear(
-                    wrapper,
-                    adapters,
-                    self.n_adapters,
-                    use_grouped_mm=self.use_grouped_mm,
-                    column_init_method=self.lora_A_init_method,
-                    row_init_method="zero",
+                return SimpleMultiLoRALinear(
+                    module,
+                    n_adapters=self.n_adapters,
+                    dim=self.dim,
+                    alpha=self.alpha,
+                    dropout=self.dropout,
+                    dropout_position=self.dropout_position,
+                    lora_A_init_method=self.lora_A_init_method,
+                    lora_dtype=self.lora_dtype,
                 )
 
             # --- Megatron parallel linears ---
@@ -226,33 +213,22 @@ class MultiLoRA(PEFT, ModuleMatcher):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _iter_multi_lora_modules(self, model) -> Iterator[MultiLoRALinear]:
-        """Yield all :class:`MultiLoRALinear` modules in *model*."""
+    _multi_lora_types = (MultiLoRALinear, SimpleMultiLoRALinear)
+
+    def _iter_multi_lora_modules(self, model) -> Iterator[nn.Module]:
+        """Yield all multi-LoRA modules in *model*."""
         models = model if isinstance(model, list) else [model]
         for model_chunk in models:
             for module in model_chunk.modules():
-                if isinstance(module, MultiLoRALinear):
+                if isinstance(module, self._multi_lora_types):
                     yield module
 
-    def _named_multi_lora_modules(self, model) -> Iterator[Tuple[str, MultiLoRALinear]]:
-        """Yield ``(fqn, module)`` pairs for all :class:`MultiLoRALinear` modules."""
+    def _named_multi_lora_modules(self, model) -> Iterator[Tuple[str, nn.Module]]:
+        """Yield ``(fqn, module)`` pairs for all multi-LoRA modules."""
         models = model if isinstance(model, list) else [model]
         for model_chunk in models:
             for name, module in model_chunk.named_modules():
-                if isinstance(module, MultiLoRALinear):
+                if isinstance(module, self._multi_lora_types):
                     yield name, module
 
 
-class _TupleLinearWrapper(nn.Module):
-    """Wraps an ``nn.Linear`` to return ``(output, bias)`` tuples like Megatron linears.
-
-    This allows :class:`MultiLoRALinear` (which inherits
-    :meth:`AdapterWrapper.base_linear_forward`) to work with plain HF models.
-    """
-
-    def __init__(self, linear: nn.Linear) -> None:
-        super().__init__()
-        self.linear = linear
-
-    def forward(self, x: torch.Tensor, *args, **kwargs) -> Tuple[torch.Tensor, None]:
-        return self.linear(x), None

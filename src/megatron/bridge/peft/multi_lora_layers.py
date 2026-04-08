@@ -103,6 +103,140 @@ class SimpleLoRAAdapter(nn.Module):
         return out
 
 
+class SimpleMultiLoRALinear(nn.Linear):
+    """Plain ``nn.Linear`` wrapped with *N* concurrent LoRA adapters.
+
+    Extends ``nn.Linear`` (like :class:`LinearAdapter`), copies the original
+    weights, freezes them, and adds N :class:`SimpleLoRAAdapter` instances.
+    Returns a plain tensor — compatible with HF models.
+
+    Args:
+        orig_linear: The original ``nn.Linear`` to adapt.
+        n_adapters: Number of adapter slots.
+        dim: LoRA rank.
+        alpha: LoRA scaling parameter.
+        dropout: Dropout probability.
+        dropout_position: ``'pre'`` or ``'post'``.
+        lora_A_init_method: Init method for the A matrix.
+        lora_dtype: Data type for adapter weights.
+    """
+
+    def __init__(
+        self,
+        orig_linear: nn.Linear,
+        n_adapters: int,
+        dim: int = 16,
+        alpha: float = 32.0,
+        dropout: float = 0.0,
+        dropout_position: Literal["pre", "post"] = "pre",
+        lora_A_init_method: str = "xavier",
+        lora_dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        assert isinstance(orig_linear, nn.Linear)
+        super().__init__(
+            in_features=orig_linear.in_features,
+            out_features=orig_linear.out_features,
+            bias=orig_linear.bias is not None,
+            device=orig_linear.weight.device,
+            dtype=orig_linear.weight.dtype,
+        )
+        self.weight.data.copy_(orig_linear.weight.data)
+        if orig_linear.bias is not None:
+            self.bias.data.copy_(orig_linear.bias.data)
+
+        # Freeze base weights
+        self.weight.requires_grad = False
+        if self.bias is not None:
+            self.bias.requires_grad = False
+
+        self.n_adapters = n_adapters
+        self.column_init_method = lora_A_init_method
+        self.row_init_method = "zero"
+        self._adapter_enabled = True
+
+        dtype = lora_dtype or orig_linear.weight.dtype
+        self.adapters = nn.ModuleList([
+            SimpleLoRAAdapter(
+                orig_linear.in_features,
+                orig_linear.out_features,
+                dim=dim,
+                alpha=alpha,
+                dropout=dropout,
+                dropout_position=dropout_position,
+                lora_A_init_method=lora_A_init_method,
+                lora_dtype=dtype,
+                device=orig_linear.weight.device,
+            )
+            for _ in range(n_adapters)
+        ])
+        self.scaling: list[float] = [a.alpha / a.dim for a in self.adapters]
+
+    def enable_adapter_layers(self) -> None:
+        self._adapter_enabled = True
+
+    def disable_adapter_layers(self) -> None:
+        self._adapter_enabled = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = torch.nn.functional.linear(x, self.weight, self.bias)
+
+        if not self._adapter_enabled:
+            return base_out
+
+        lora_num_tokens = get_lora_num_tokens()
+        x_flat = x.reshape(-1, x.shape[-1])
+        offsets = lora_num_tokens.cumsum(dim=0)
+        total = offsets[-1].item()
+        assert total == x_flat.shape[0], (
+            f"lora_num_tokens sum {total} != token count {x_flat.shape[0]}"
+        )
+
+        adapter_outputs = []
+        prev = 0
+        for i in range(self.n_adapters):
+            cur = offsets[i].item()
+            if cur == prev:
+                prev = cur
+                continue
+            adapter = self.adapters[i]
+            out = adapter(x_flat[prev:cur])
+            built_in_scale = adapter.alpha / adapter.dim
+            if abs(self.scaling[i] - built_in_scale) > 1e-8:
+                out = out * (self.scaling[i] / built_in_scale)
+            adapter_outputs.append(out)
+            prev = cur
+
+        if not adapter_outputs:
+            return base_out
+
+        adapter_output = torch.cat(adapter_outputs, dim=0).reshape(base_out.shape)
+        return base_out + adapter_output
+
+    # --- Per-adapter lifecycle (same interface as MultiLoRALinear) ---
+
+    def reset_adapter(self, idx: int) -> None:
+        adapter = self.adapters[idx]
+        adapter._get_init_fn(self.column_init_method)(adapter.linear_in.weight.data)
+        adapter._get_init_fn(self.row_init_method)(adapter.linear_out.weight.data)
+        self.scaling[idx] = adapter.alpha / adapter.dim
+
+    def set_scaling(self, idx: int, alpha: float, rank: int) -> None:
+        self.scaling[idx] = alpha / rank
+
+    def named_parameters_for_adapter(self, idx: int) -> Iterator[Tuple[str, nn.Parameter]]:
+        prefix = f"adapters.{idx}."
+        for name, param in self.adapters[idx].named_parameters():
+            yield prefix + name, param
+
+    def state_dict_for_adapter(self, idx: int, prefix: str = "") -> Dict[str, Any]:
+        sd: Dict[str, Any] = {}
+        self.adapters[idx].state_dict(destination=sd, prefix=f"{prefix}adapters.{idx}.")
+        return sd
+
+    def load_adapter(self, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
+        self.adapters[idx].load_state_dict(state_dict, strict=True)
+
+
 class MultiLoRALinear(AdapterWrapper):
     """Megatron parallel linear wrapped with *N* concurrent LoRA adapters.
 
