@@ -69,7 +69,7 @@ def get_common_configs(hf_pretrained: PreTrainedCausalLM) -> dict:
     configs["multi_latent_attention"] = True
     configs["generation_config"] = hf_pretrained.generation_config
     configs["vocab_size"] = hf_config.vocab_size
-    configs["rotary_base"] = hf_config.rope_theta
+    configs["rotary_base"] = hf_config.rope_parameters["rope_theta"]
     configs["init_method_std"] = hf_config.initializer_range
     configs["layernorm_epsilon"] = hf_config.rms_norm_eps
 
