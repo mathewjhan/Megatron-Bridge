@@ -14,22 +14,24 @@
 
 """Global routing state for multi-LoRA.
 
-The downstream framework sets ``lora_num_tokens`` before each forward pass
-to indicate how many tokens in the current micro-batch belong to each
-adapter.  Every :class:`MultiLoRALinear` layer reads this tensor to select
-the active adapter.
+The downstream framework sets ``lora_num_tokens`` and ``scaling_factors``
+before each forward pass.  Every :class:`MultiLoRALinear` layer reads
+these to route tokens and scale adapter outputs.
 
 Typical usage::
 
     from megatron.bridge.peft.multi_lora_state import (
         set_lora_num_tokens,
-        get_active_adapter_idx,
+        set_scaling_factors,
     )
 
     # Before each micro-batch forward
     num_tokens = torch.zeros(n_adapters, dtype=torch.int32, device="cuda")
     num_tokens[active_adapter] = batch_token_count
     set_lora_num_tokens(num_tokens)
+
+    scaling = torch.tensor([alpha_0/r_0, alpha_1/r_1, ...], device="cuda")
+    set_scaling_factors(scaling)
 """
 
 from typing import Optional
@@ -37,6 +39,7 @@ from typing import Optional
 import torch
 
 _LORA_NUM_TOKENS: Optional[torch.Tensor] = None
+_SCALING_FACTORS: Optional[torch.Tensor] = None
 
 
 def set_lora_num_tokens(num_tokens: torch.Tensor, reset_reference: bool = False) -> None:
@@ -66,6 +69,32 @@ def get_lora_num_tokens() -> torch.Tensor:
     return _LORA_NUM_TOKENS
 
 
+def set_scaling_factors(scaling_factors: torch.Tensor, reset_reference: bool = False) -> None:
+    """Set per-adapter scaling factors (alpha / rank) for the current micro-batch.
+
+    Args:
+        scaling_factors: Tensor of shape ``[n_adapters]`` with scaling values.
+        reset_reference: If True, replace the tensor reference.
+            If False, copy values in-place.
+    """
+    global _SCALING_FACTORS
+    if _SCALING_FACTORS is None or reset_reference:
+        _SCALING_FACTORS = scaling_factors
+    else:
+        _SCALING_FACTORS.copy_(scaling_factors)
+
+
+def get_scaling_factors() -> torch.Tensor:
+    """Return the current ``scaling_factors`` tensor.
+
+    Raises:
+        RuntimeError: If called before :func:`set_scaling_factors`.
+    """
+    if _SCALING_FACTORS is None:
+        raise RuntimeError("scaling_factors not initialized. Call set_scaling_factors() first.")
+    return _SCALING_FACTORS
+
+
 def get_active_adapter_idx() -> int:
     """Return the index of the adapter with the most tokens.
 
@@ -78,5 +107,6 @@ def get_active_adapter_idx() -> int:
 
 def reset_state() -> None:
     """Clear all global multi-LoRA state.  Useful in tests."""
-    global _LORA_NUM_TOKENS
+    global _LORA_NUM_TOKENS, _SCALING_FACTORS
     _LORA_NUM_TOKENS = None
+    _SCALING_FACTORS = None

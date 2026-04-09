@@ -43,8 +43,8 @@ from megatron.core.transformer.moe.router import TopKRouter
 
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleMultiLoRALinear
-from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear, is_expert_linear
+from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, MultiParallelLinearAdapter, SimpleMultiLoRALinear
+from megatron.bridge.peft.utils import get_adapter_attributes_from_linear, is_expert_linear
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,6 @@ class MultiLoRA(PEFT, ModuleMatcher):
     lora_B_init_method: str = "zero"
     a2a_experimental: bool = False
     lora_dtype: Optional[torch.dtype] = None
-    use_grouped_mm: bool = False
 
     # ------------------------------------------------------------------
     # transform (called by walk for every module in the model)
@@ -123,36 +122,22 @@ class MultiLoRA(PEFT, ModuleMatcher):
             attrs = get_adapter_attributes_from_linear(module)
             logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to: {full_name}")
 
-            adapters = nn.ModuleList()
-            for _ in range(self.n_adapters):
-                adapter = ParallelLinearAdapter(
-                    attrs.in_features,
-                    attrs.out_features,
-                    self.dim,
-                    base_linear_name=full_name,
-                    activation="identity",
-                    column_init_method=self.lora_A_init_method,
-                    row_init_method=self.lora_B_init_method,
-                    input_is_parallel=attrs.input_is_parallel,
-                    dropout=self.dropout,
-                    dropout_position=self.dropout_position,
-                    model_parallel_config=getattr(module, "config", None),
-                    alpha=self.alpha,
-                    a2a_experimental=self.a2a_experimental,
-                    disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
-                    disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
-                    base_linear_is_parallel=attrs.base_linear_is_parallel,
-                )
-                adapters.append(adapter)
-
-            return MultiLoRALinear(
-                module,
-                adapters,
-                self.n_adapters,
-                use_grouped_mm=self.use_grouped_mm,
+            multi_adapter = MultiParallelLinearAdapter(
+                n_adapters=self.n_adapters,
+                in_features=attrs.in_features,
+                out_features=attrs.out_features,
+                dim=self.dim,
+                alpha=self.alpha,
+                input_is_parallel=attrs.input_is_parallel,
                 column_init_method=self.lora_A_init_method,
                 row_init_method=self.lora_B_init_method,
+                disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
+                use_a2a=self.a2a_experimental,
+                dtype=next(module.parameters()).dtype,
+                device=next(module.parameters()).device,
             )
+
+            return MultiLoRALinear(module, multi_adapter, self.n_adapters)
 
         return module
 
@@ -164,11 +149,6 @@ class MultiLoRA(PEFT, ModuleMatcher):
         """Re-initialise adapter *idx* across all :class:`MultiLoRALinear` layers."""
         for module in self._iter_multi_lora_modules(model):
             module.reset_adapter(idx)
-
-    def set_adapter_scaling(self, model, idx: int, alpha: float, rank: int) -> None:
-        """Set per-adapter scaling for adapter *idx* across all layers."""
-        for module in self._iter_multi_lora_modules(model):
-            module.set_scaling(idx, alpha, rank)
 
     def named_parameters_for_adapter(self, model, idx: int) -> Iterator[Tuple[str, nn.Parameter]]:
         """Yield all parameters belonging to adapter *idx* across the model."""
