@@ -14,99 +14,60 @@
 
 """Global routing state for multi-LoRA.
 
-The downstream framework sets ``lora_num_tokens`` and ``scaling_factors``
-before each forward pass.  Every :class:`MultiLoRALinear` layer reads
-these to route tokens and scale adapter outputs.
+The downstream framework sets routing state before each forward pass.
+Every :class:`MultiLoRALinear` layer reads from the singleton
+:class:`MultiLoRAState` instance.
 
 Typical usage::
 
-    from megatron.bridge.peft.multi_lora_state import (
-        set_lora_num_tokens,
-        set_scaling_factors,
-    )
+    from megatron.bridge.peft.multi_lora_state import multi_lora_state
+
+    # One-time init
+    multi_lora_state.init(n_adapters=4, device="cuda")
 
     # Before each micro-batch forward
-    num_tokens = torch.zeros(n_adapters, dtype=torch.int32, device="cuda")
-    num_tokens[active_adapter] = batch_token_count
-    set_lora_num_tokens(num_tokens)
-
-    scaling = torch.tensor([alpha_0/r_0, alpha_1/r_1, ...], device="cuda")
-    set_scaling_factors(scaling)
+    multi_lora_state.lora_num_tokens.copy_(torch.tensor([100, 50, 80, 0]))
+    multi_lora_state.scaling_factors.copy_(torch.tensor([2.0, 2.0, 1.0, 1.0]))
 """
 
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 
-_LORA_NUM_TOKENS: Optional[torch.Tensor] = None
-_SCALING_FACTORS: Optional[torch.Tensor] = None
 
+@dataclass
+class MultiLoRAState:
+    """Singleton holding per-micro-batch multi-LoRA routing state.
 
-def set_lora_num_tokens(num_tokens: torch.Tensor, reset_reference: bool = False) -> None:
-    """Set the number of tokens per adapter for the current micro-batch.
-
-    Args:
-        num_tokens: Tensor of shape ``[n_adapters]`` with token counts.
-        reset_reference: If True, replace the tensor reference.
-            If False, copy values in-place (requires a prior call with
-            ``reset_reference=True`` to establish the tensor).
+    Attributes:
+        lora_num_tokens: Token counts per adapter, shape ``[n_adapters]``.
+            Defines contiguous token ranges: first ``lora_num_tokens[0]``
+            tokens use adapter 0, next ``lora_num_tokens[1]`` use adapter 1, etc.
+        scaling_factors: Per-adapter scaling ``alpha / rank``, shape ``[n_adapters]``.
     """
-    global _LORA_NUM_TOKENS
-    if _LORA_NUM_TOKENS is None or reset_reference:
-        _LORA_NUM_TOKENS = num_tokens
-    else:
-        _LORA_NUM_TOKENS.copy_(num_tokens)
+
+    lora_num_tokens: Optional[torch.Tensor] = None
+    scaling_factors: Optional[torch.Tensor] = None
+
+    def init(self, n_adapters: int, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.bfloat16) -> None:
+        """Allocate state tensors. Call once at startup."""
+        self.lora_num_tokens = torch.zeros(n_adapters, dtype=torch.int32, device=device)
+        self.scaling_factors = torch.ones(n_adapters, dtype=dtype, device=device)
+
+    def reset(self) -> None:
+        """Clear all state. Useful in tests."""
+        self.lora_num_tokens = None
+        self.scaling_factors = None
+
+    def get_lora_num_tokens(self) -> torch.Tensor:
+        assert self.lora_num_tokens is not None, "MultiLoRAState not initialized. Call init() first."
+        return self.lora_num_tokens
+
+    def get_scaling_factors(self) -> torch.Tensor:
+        assert self.scaling_factors is not None, "MultiLoRAState not initialized. Call init() first."
+        return self.scaling_factors
 
 
-def get_lora_num_tokens() -> torch.Tensor:
-    """Return the current ``lora_num_tokens`` tensor.
-
-    Raises:
-        RuntimeError: If called before :func:`set_lora_num_tokens`.
-    """
-    if _LORA_NUM_TOKENS is None:
-        raise RuntimeError("lora_num_tokens not initialized. Call set_lora_num_tokens() first.")
-    return _LORA_NUM_TOKENS
-
-
-def set_scaling_factors(scaling_factors: torch.Tensor, reset_reference: bool = False) -> None:
-    """Set per-adapter scaling factors (alpha / rank) for the current micro-batch.
-
-    Args:
-        scaling_factors: Tensor of shape ``[n_adapters]`` with scaling values.
-        reset_reference: If True, replace the tensor reference.
-            If False, copy values in-place.
-    """
-    global _SCALING_FACTORS
-    if _SCALING_FACTORS is None or reset_reference:
-        _SCALING_FACTORS = scaling_factors
-    else:
-        _SCALING_FACTORS.copy_(scaling_factors)
-
-
-def get_scaling_factors() -> torch.Tensor:
-    """Return the current ``scaling_factors`` tensor.
-
-    Raises:
-        RuntimeError: If called before :func:`set_scaling_factors`.
-    """
-    if _SCALING_FACTORS is None:
-        raise RuntimeError("scaling_factors not initialized. Call set_scaling_factors() first.")
-    return _SCALING_FACTORS
-
-
-def get_active_adapter_idx() -> int:
-    """Return the index of the adapter with the most tokens.
-
-    This is the single-adapter-per-microbatch fast path: the downstream
-    framework guarantees that only one entry in ``lora_num_tokens`` is
-    non-zero per micro-batch.
-    """
-    return get_lora_num_tokens().argmax().item()
-
-
-def reset_state() -> None:
-    """Clear all global multi-LoRA state.  Useful in tests."""
-    global _LORA_NUM_TOKENS, _SCALING_FACTORS
-    _LORA_NUM_TOKENS = None
-    _SCALING_FACTORS = None
+# Singleton instance
+multi_lora_state = MultiLoRAState()

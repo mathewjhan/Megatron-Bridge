@@ -41,7 +41,7 @@ from megatron.core.tensor_parallel.mappings import (
 )
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
-from megatron.bridge.peft.multi_lora_state import get_lora_num_tokens, get_scaling_factors
+from megatron.bridge.peft.multi_lora_state import multi_lora_state
 from megatron.bridge.peft.utils import all2all_hp2sp
 
 
@@ -192,7 +192,7 @@ class SimpleMultiLoRALinear(nn.Linear):
         if not self._adapter_enabled:
             return base_out
 
-        lora_num_tokens = get_lora_num_tokens()
+        lora_num_tokens = multi_lora_state.get_lora_num_tokens()
         x_flat = x.reshape(-1, x.shape[-1])
         offsets = lora_num_tokens.cumsum(dim=0)
         total = offsets[-1].item()
@@ -217,7 +217,7 @@ class SimpleMultiLoRALinear(nn.Linear):
         adapter_output = torch.cat(adapter_outputs, dim=0)
 
         # Per-token scaling from global state
-        scaling_factors = get_scaling_factors()
+        scaling_factors = multi_lora_state.get_scaling_factors()
         per_token_scaling = torch.repeat_interleave(scaling_factors, lora_num_tokens).unsqueeze(-1)
         adapter_output = adapter_output * per_token_scaling
 
@@ -380,7 +380,7 @@ class MultiParallelLinearAdapter(nn.Module):
                 out = scatter_to_sequence_parallel_region(out)
 
         # --- Per-token scaling from global state ---
-        scaling_factors = get_scaling_factors()
+        scaling_factors = multi_lora_state.get_scaling_factors()
         per_token_scaling = torch.repeat_interleave(scaling_factors, lora_num_tokens).unsqueeze(-1)
         out = out * per_token_scaling
 
@@ -444,7 +444,7 @@ class MultiLoRALinear(AdapterWrapper):
         if not self._adapter_enabled:
             return linear_output, bias
 
-        lora_num_tokens = get_lora_num_tokens()
+        lora_num_tokens = multi_lora_state.get_lora_num_tokens()
         adapter_output = self.multi_adapter(layernorm_output.contiguous(), lora_num_tokens)
         adapter_output = adapter_output.reshape(linear_output.shape)
         return linear_output + adapter_output, bias

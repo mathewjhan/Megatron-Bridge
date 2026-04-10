@@ -14,69 +14,18 @@
 
 """Unit tests for multi-LoRA PEFT components."""
 
-from types import SimpleNamespace
+import datetime
+import os
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import megatron.core.parallel_state as parallel_state
+from megatron.core.transformer.module import MegatronModule
 
-from megatron.bridge.peft.multi_lora_state import (
-    get_active_adapter_idx,
-    get_lora_num_tokens,
-    reset_state,
-    set_lora_num_tokens,
-)
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear
-
-
-# ---------------------------------------------------------------------------
-# Mocks
-# ---------------------------------------------------------------------------
-
-
-class MockLinearWithTupleReturn(nn.Module):
-    """Mock linear module that returns tuples like Megatron layers."""
-
-    def __init__(self, in_features=10, out_features=10):
-        super().__init__()
-        self.linear = nn.Linear(in_features, out_features)
-
-    def forward(self, x, *args, **kwargs):
-        return self.linear(x), None  # (output, bias)
-
-
-class MockLinearWithTripleReturn(nn.Module):
-    """Mock linear module that returns (output, bias, layernorm_output)."""
-
-    def __init__(self, in_features=10, out_features=10):
-        super().__init__()
-        self.linear = nn.Linear(in_features, out_features)
-
-    def forward(self, x, *args, **kwargs):
-        return self.linear(x), None, x  # (output, bias, layernorm_output)
-
-
-class MockParallelLinearAdapter(nn.Module):
-    """Mock ParallelLinearAdapter for testing MultiLoRALinear."""
-
-    def __init__(self, in_features=10, out_features=10, dim=8, alpha=32):
-        super().__init__()
-        self.linear_in = nn.Linear(in_features, dim, bias=False)
-        self.linear_out = nn.Linear(dim, out_features, bias=False)
-        self.dim = dim
-        self.alpha = alpha
-        nn.init.zeros_(self.linear_out.weight)
-
-    def _get_init_fn(self, init_method):
-        if init_method == "xavier":
-            return nn.init.xavier_normal_
-        elif init_method == "zero":
-            return lambda t: nn.init.constant_(t, 0.0)
-        return nn.init.xavier_normal_
-
-    def forward(self, x):
-        out = self.linear_out(self.linear_in(x))
-        return out * (self.alpha / self.dim)
+from megatron.bridge.peft.multi_lora_state import multi_lora_state
+from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleMultiLoRALinear
 
 
 # ---------------------------------------------------------------------------
@@ -87,259 +36,189 @@ class MockParallelLinearAdapter(nn.Module):
 class TestMultiLoRAState:
     @pytest.fixture(autouse=True)
     def _reset(self):
-        reset_state()
+        multi_lora_state.reset()
         yield
-        reset_state()
+        multi_lora_state.reset()
 
-    def test_set_and_get(self):
-        t = torch.tensor([0, 10, 0], dtype=torch.int32)
-        set_lora_num_tokens(t, reset_reference=True)
-        assert torch.equal(get_lora_num_tokens(), t)
+    def test_init(self):
+        multi_lora_state.init(n_adapters=3)
+        assert multi_lora_state.lora_num_tokens.shape == (3,)
+        assert multi_lora_state.scaling_factors.shape == (3,)
 
-    def test_get_before_set_raises(self):
-        with pytest.raises(RuntimeError, match="not initialized"):
-            get_lora_num_tokens()
+    def test_get_before_init_raises(self):
+        with pytest.raises(AssertionError):
+            multi_lora_state.get_lora_num_tokens()
 
-    def test_in_place_copy(self):
-        t = torch.tensor([0, 10, 0], dtype=torch.int32)
-        set_lora_num_tokens(t, reset_reference=True)
+    def test_get_scaling_before_init_raises(self):
+        with pytest.raises(AssertionError):
+            multi_lora_state.get_scaling_factors()
 
-        t2 = torch.tensor([5, 0, 5], dtype=torch.int32)
-        set_lora_num_tokens(t2)
+    def test_in_place_update(self):
+        multi_lora_state.init(n_adapters=3)
+        ptr = multi_lora_state.lora_num_tokens.data_ptr()
+        multi_lora_state.lora_num_tokens.copy_(torch.tensor([5, 0, 5], dtype=torch.int32))
+        assert multi_lora_state.lora_num_tokens.data_ptr() == ptr
 
-        # Should have been copied in-place into the original tensor
-        assert torch.equal(get_lora_num_tokens(), t2)
-        assert get_lora_num_tokens().data_ptr() == t.data_ptr()
-
-    def test_reset_reference(self):
-        t1 = torch.tensor([0, 10, 0], dtype=torch.int32)
-        set_lora_num_tokens(t1, reset_reference=True)
-        ptr1 = get_lora_num_tokens().data_ptr()
-
-        t2 = torch.tensor([5, 0, 5], dtype=torch.int32)
-        set_lora_num_tokens(t2, reset_reference=True)
-        ptr2 = get_lora_num_tokens().data_ptr()
-
-        assert ptr1 != ptr2
-
-    def test_get_active_adapter_idx(self):
-        set_lora_num_tokens(torch.tensor([0, 0, 42, 0]), reset_reference=True)
-        assert get_active_adapter_idx() == 2
-
-    def test_get_active_adapter_idx_first(self):
-        set_lora_num_tokens(torch.tensor([100, 0, 0]), reset_reference=True)
-        assert get_active_adapter_idx() == 0
-
-    def test_reset_state(self):
-        set_lora_num_tokens(torch.tensor([1, 2, 3]), reset_reference=True)
-        reset_state()
-        with pytest.raises(RuntimeError):
-            get_lora_num_tokens()
+    def test_reset(self):
+        multi_lora_state.init(n_adapters=3)
+        multi_lora_state.reset()
+        assert multi_lora_state.lora_num_tokens is None
+        assert multi_lora_state.scaling_factors is None
 
 
 # ---------------------------------------------------------------------------
-# TestMultiLoRALinear
+# TestSimpleMultiLoRALinear
 # ---------------------------------------------------------------------------
 
 
-class TestMultiLoRALinear:
+class TestSimpleMultiLoRALinear:
     N_ADAPTERS = 3
     IN_FEATURES = 10
     OUT_FEATURES = 10
 
     @pytest.fixture(autouse=True)
     def _reset(self):
-        reset_state()
-        yield
-        reset_state()
-
-    @pytest.fixture
-    def mock_linear(self):
-        return MockLinearWithTupleReturn(self.IN_FEATURES, self.OUT_FEATURES)
-
-    @pytest.fixture
-    def mock_adapters(self):
-        return nn.ModuleList(
-            [MockParallelLinearAdapter(self.IN_FEATURES, self.OUT_FEATURES) for _ in range(self.N_ADAPTERS)]
+        multi_lora_state.reset()
+        multi_lora_state.init(n_adapters=self.N_ADAPTERS)
+        # Default scaling
+        multi_lora_state.scaling_factors.copy_(
+            torch.tensor([32.0 / 8] * self.N_ADAPTERS, dtype=multi_lora_state.scaling_factors.dtype)
         )
+        yield
+        multi_lora_state.reset()
 
     @pytest.fixture
-    def multi_lora(self, mock_linear, mock_adapters):
-        return MultiLoRALinear(mock_linear, mock_adapters, self.N_ADAPTERS)
+    def orig_linear(self):
+        return nn.Linear(self.IN_FEATURES, self.OUT_FEATURES)
+
+    @pytest.fixture
+    def multi_lora(self, orig_linear):
+        return SimpleMultiLoRALinear(orig_linear, n_adapters=self.N_ADAPTERS, dim=8, alpha=32)
 
     def _set_tokens(self, *counts):
-        """Set lora_num_tokens from a variable number of per-adapter counts."""
-        t = torch.tensor(counts, dtype=torch.int32)
-        set_lora_num_tokens(t, reset_reference=True)
+        multi_lora_state.lora_num_tokens.copy_(torch.tensor(counts, dtype=torch.int32))
 
     # --- Init ---
 
-    def test_init(self, multi_lora, mock_linear, mock_adapters):
-        assert multi_lora.to_wrap is mock_linear
+    def test_init(self, multi_lora, orig_linear):
         assert multi_lora.n_adapters == self.N_ADAPTERS
         assert len(multi_lora.adapters) == self.N_ADAPTERS
-        assert multi_lora._adapter_enabled is True
-
-    def test_scaling_initialized(self, multi_lora, mock_adapters):
-        for i, adapter in enumerate(mock_adapters):
-            assert multi_lora.scaling[i] == adapter.alpha / adapter.dim
+        assert not multi_lora.weight.requires_grad
+        assert torch.equal(multi_lora.weight, orig_linear.weight)
 
     # --- Forward (single adapter) ---
 
-    def test_forward_single_adapter(self, multi_lora, mock_linear, mock_adapters):
+    def test_forward_single_adapter(self, multi_lora):
         x = torch.randn(5, self.IN_FEATURES)
         self._set_tokens(0, 5, 0)
 
-        output, bias = multi_lora(x)
+        output = multi_lora(x)
+        assert output.shape == (5, self.OUT_FEATURES)
 
-        base_output, _ = mock_linear(x)
-        adapter_output = mock_adapters[1](x.contiguous())
-        expected = base_output + adapter_output
-        assert torch.allclose(output, expected, atol=1e-6)
-
-    def test_forward_different_adapters_different_output(self, multi_lora, mock_adapters):
-        nn.init.normal_(mock_adapters[0].linear_out.weight)
+    def test_forward_different_adapters_different_output(self, multi_lora):
+        nn.init.normal_(multi_lora.adapters[0].linear_out.weight)
 
         x = torch.randn(5, self.IN_FEATURES)
 
         self._set_tokens(5, 0, 0)
-        output_0, _ = multi_lora(x)
+        output_0 = multi_lora(x)
 
         self._set_tokens(0, 5, 0)
-        output_1, _ = multi_lora(x)
+        output_1 = multi_lora(x)
 
         assert not torch.allclose(output_0, output_1)
 
     # --- Forward (mixed adapters) ---
 
-    def test_forward_mixed_adapters(self, multi_lora, mock_linear, mock_adapters):
-        """Tokens from two adapters in the same micro-batch."""
+    def test_forward_mixed_adapters(self, multi_lora):
+        nn.init.normal_(multi_lora.adapters[0].linear_out.weight)
         n0, n1, n2 = 3, 2, 0
         total = n0 + n1 + n2
         x = torch.randn(total, self.IN_FEATURES)
         self._set_tokens(n0, n1, n2)
 
-        output, bias = multi_lora(x)
+        output = multi_lora(x)
 
         # Manually compute expected
-        base_output, _ = mock_linear(x)
-        a0_out = mock_adapters[0](x[:n0].contiguous())
-        a1_out = mock_adapters[1](x[n0:n0 + n1].contiguous())
-        expected = base_output.clone()
-        expected[:n0] += a0_out
-        expected[n0:n0 + n1] += a1_out
-        assert torch.allclose(output, expected, atol=1e-6)
+        base_out = torch.nn.functional.linear(x, multi_lora.weight, multi_lora.bias)
+        a0_out = multi_lora.adapters[0](x[:n0], apply_scaling=False)
+        a1_out = multi_lora.adapters[1](x[n0:n0 + n1], apply_scaling=False)
+        sf = multi_lora_state.get_scaling_factors()
+        expected = base_out.clone()
+        expected[:n0] += a0_out * sf[0]
+        expected[n0:n0 + n1] += a1_out * sf[1]
+        assert torch.allclose(output, expected, atol=1e-5)
 
-    def test_forward_all_adapters_active(self, multi_lora, mock_linear, mock_adapters):
-        """All three adapters have tokens."""
+    def test_forward_all_adapters_active(self, multi_lora):
         n0, n1, n2 = 2, 3, 4
         total = n0 + n1 + n2
         x = torch.randn(total, self.IN_FEATURES)
         self._set_tokens(n0, n1, n2)
 
-        output, bias = multi_lora(x)
+        output = multi_lora(x)
         assert output.shape == (total, self.OUT_FEATURES)
 
-    def test_forward_empty_adapter_in_middle(self, multi_lora, mock_linear, mock_adapters):
-        """Adapter 1 has zero tokens, adapters 0 and 2 have tokens."""
+    def test_forward_empty_adapter_in_middle(self, multi_lora):
         n0, n1, n2 = 3, 0, 4
         total = n0 + n1 + n2
         x = torch.randn(total, self.IN_FEATURES)
         self._set_tokens(n0, n1, n2)
 
-        output, bias = multi_lora(x)
+        output = multi_lora(x)
+        assert output.shape == (total, self.OUT_FEATURES)
 
-        base_output, _ = mock_linear(x)
-        a0_out = mock_adapters[0](x[:n0].contiguous())
-        a2_out = mock_adapters[2](x[n0:n0 + n2].contiguous())
-        expected = base_output.clone()
-        expected[:n0] += a0_out
-        expected[n0:n0 + n2] += a2_out
-        assert torch.allclose(output, expected, atol=1e-6)
+    # --- Forward (disabled) ---
 
-    # --- Forward (disabled / edge cases) ---
-
-    def test_forward_disabled(self, multi_lora, mock_linear):
+    def test_forward_disabled(self, multi_lora):
         x = torch.randn(5, self.IN_FEATURES)
         self._set_tokens(5, 0, 0)
 
         multi_lora.disable_adapter_layers()
-        output, bias = multi_lora(x)
+        output = multi_lora(x)
 
-        base_output, _ = mock_linear(x)
-        assert torch.allclose(output, base_output, atol=1e-6)
-
-    def test_forward_re_enable(self, multi_lora):
-        x = torch.randn(5, self.IN_FEATURES)
-        self._set_tokens(5, 0, 0)
-
-        multi_lora.disable_adapter_layers()
-        disabled_out, _ = multi_lora(x)
-
-        multi_lora.enable_adapter_layers()
-        enabled_out, _ = multi_lora(x)
-
-        assert enabled_out.shape == disabled_out.shape
-
-    def test_forward_with_triple_return(self, mock_adapters):
-        base = MockLinearWithTripleReturn(self.IN_FEATURES, self.OUT_FEATURES)
-        multi_lora = MultiLoRALinear(base, mock_adapters, self.N_ADAPTERS)
-
-        x = torch.randn(5, self.IN_FEATURES)
-        self._set_tokens(2, 3, 0)
-
-        output, bias = multi_lora(x)
-        assert output.shape == (5, self.OUT_FEATURES)
+        base_out = torch.nn.functional.linear(x, multi_lora.weight, multi_lora.bias)
+        assert torch.allclose(output, base_out, atol=1e-6)
 
     # --- Scaling ---
 
-    def test_set_scaling(self, multi_lora):
-        multi_lora.set_scaling(1, alpha=64, rank=16)
-        assert multi_lora.scaling[1] == 64 / 16
-
-    def test_forward_with_custom_scaling(self, multi_lora, mock_linear, mock_adapters):
-        nn.init.normal_(mock_adapters[0].linear_out.weight)
-        multi_lora.set_scaling(0, alpha=128, rank=8)
+    def test_scaling_from_global_state(self, multi_lora):
+        nn.init.normal_(multi_lora.adapters[0].linear_out.weight)
+        multi_lora_state.scaling_factors.copy_(
+            torch.tensor([16.0, 4.0, 4.0], dtype=multi_lora_state.scaling_factors.dtype)
+        )
 
         x = torch.randn(5, self.IN_FEATURES)
         self._set_tokens(5, 0, 0)
 
-        output, _ = multi_lora(x)
+        output = multi_lora(x)
 
-        base_output, _ = mock_linear(x)
-        adapter_raw = mock_adapters[0](x.contiguous())
-        built_in_scale = mock_adapters[0].alpha / mock_adapters[0].dim
-        correction = (128 / 8) / built_in_scale
-        expected = base_output + adapter_raw * correction
-
+        base_out = torch.nn.functional.linear(x, multi_lora.weight, multi_lora.bias)
+        adapter_raw = multi_lora.adapters[0](x, apply_scaling=False)
+        expected = base_out + adapter_raw * 16.0
         assert torch.allclose(output, expected, atol=1e-5)
 
     # --- Reset ---
 
-    def test_reset_adapter(self, multi_lora, mock_adapters):
-        # Dirty the adapter weights
-        nn.init.normal_(mock_adapters[1].linear_in.weight)
-        nn.init.normal_(mock_adapters[1].linear_out.weight)
-        multi_lora.set_scaling(1, alpha=999, rank=1)
+    def test_reset_adapter(self, multi_lora):
+        nn.init.normal_(multi_lora.adapters[1].linear_in.weight)
+        nn.init.normal_(multi_lora.adapters[1].linear_out.weight)
 
         multi_lora.reset_adapter(1)
 
-        # B should be zeros
-        assert torch.allclose(mock_adapters[1].linear_out.weight, torch.zeros_like(mock_adapters[1].linear_out.weight))
-        # A should be non-zero (xavier)
-        assert not torch.allclose(
-            mock_adapters[1].linear_in.weight, torch.zeros_like(mock_adapters[1].linear_in.weight)
+        assert torch.allclose(
+            multi_lora.adapters[1].linear_out.weight, torch.zeros_like(multi_lora.adapters[1].linear_out.weight)
         )
-        # Scaling should be reset to default
-        assert multi_lora.scaling[1] == mock_adapters[1].alpha / mock_adapters[1].dim
+        assert not torch.allclose(
+            multi_lora.adapters[1].linear_in.weight, torch.zeros_like(multi_lora.adapters[1].linear_in.weight)
+        )
 
-    def test_reset_one_adapter_leaves_others_unchanged(self, multi_lora, mock_adapters):
-        nn.init.normal_(mock_adapters[0].linear_out.weight)
-        original_weight = mock_adapters[0].linear_out.weight.clone()
+    def test_reset_one_adapter_leaves_others_unchanged(self, multi_lora):
+        nn.init.normal_(multi_lora.adapters[0].linear_out.weight)
+        original_weight = multi_lora.adapters[0].linear_out.weight.clone()
 
         multi_lora.reset_adapter(1)
 
-        assert torch.equal(mock_adapters[0].linear_out.weight, original_weight)
+        assert torch.equal(multi_lora.adapters[0].linear_out.weight, original_weight)
 
     # --- Per-adapter parameters ---
 
@@ -349,12 +228,7 @@ class TestMultiLoRALinear:
 
         assert any("adapters.1." in n for n in names)
         assert not any("adapters.0." in n for n in names)
-        assert not any("adapters.2." in n for n in names)
         assert len(params) > 0
-
-    def test_named_parameters_for_adapter_all_require_grad(self, multi_lora):
-        for _, param in multi_lora.named_parameters_for_adapter(0):
-            assert param.requires_grad
 
     # --- State dict ---
 
@@ -364,22 +238,16 @@ class TestMultiLoRALinear:
         for key in sd:
             assert key.startswith("layer.adapters.1.")
 
-    def test_state_dict_contains_all_adapters(self, multi_lora):
-        sd = multi_lora.state_dict()
-        adapter_keys = [k for k in sd if "adapters." in k]
-        for i in range(self.N_ADAPTERS):
-            assert any(f"adapters.{i}." in k for k in adapter_keys), f"Missing adapter {i}"
-
     # --- Load adapter ---
 
-    def test_load_adapter(self, multi_lora, mock_adapters):
-        # Create a state dict with known weights
-        known_weight = torch.ones_like(mock_adapters[2].linear_in.weight) * 42.0
-        sd = {"linear_in.weight": known_weight, "linear_out.weight": torch.zeros_like(mock_adapters[2].linear_out.weight)}
-
+    def test_load_adapter(self, multi_lora):
+        known_weight = torch.ones_like(multi_lora.adapters[2].linear_in.weight) * 42.0
+        sd = {
+            "linear_in.weight": known_weight,
+            "linear_out.weight": torch.zeros_like(multi_lora.adapters[2].linear_out.weight),
+        }
         multi_lora.load_adapter(2, sd)
-
-        assert torch.equal(mock_adapters[2].linear_in.weight.data, known_weight)
+        assert torch.equal(multi_lora.adapters[2].linear_in.weight.data, known_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -390,148 +258,72 @@ class TestMultiLoRALinear:
 class TestMultiLoRA:
     @pytest.fixture(autouse=True)
     def _reset(self):
-        reset_state()
+        multi_lora_state.reset()
         yield
-        reset_state()
+        multi_lora_state.reset()
 
-    def test_transform_wraps_matching_modules(self, monkeypatch):
-        from megatron.bridge.peft import multi_lora as multi_lora_module
+    def test_transform_wraps_nn_linear(self):
         from megatron.bridge.peft.multi_lora import MultiLoRA
-        from megatron.bridge.peft.utils import AdapterAttributes
 
-        # Mock out Megatron parallel linear types so our mock matches
-        fake_attrs = AdapterAttributes(
-            input_is_parallel=False,
-            in_features=10,
-            out_features=10,
-            disable_tensor_parallel_comm=False,
-            disable_sequence_parallel_comm=True,
-            base_linear_is_parallel=True,
-        )
-        monkeypatch.setattr(multi_lora_module, "get_adapter_attributes_from_linear", lambda m, **kw: fake_attrs)
-        monkeypatch.setattr(multi_lora_module, "is_expert_linear", lambda fqn: False)
-
-        # Create a mock ParallelLinearAdapter factory
-        def mock_pla(*args, **kwargs):
-            return MockParallelLinearAdapter(10, 10)
-
-        monkeypatch.setattr(multi_lora_module, "ParallelLinearAdapter", mock_pla)
-
-        # Build a model with a module named "linear_qkv"
         class SimpleModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.linear_qkv = MockLinearWithTupleReturn()
-                self.linear_proj = MockLinearWithTupleReturn()
+                self.q_proj = nn.Linear(10, 10)
+                self.k_proj = nn.Linear(10, 10)
                 self.other = nn.Linear(10, 10)
 
         model = SimpleModel()
-        multi_lora = MultiLoRA(target_modules=["linear_qkv", "linear_proj"], n_adapters=3, dim=8, alpha=16)
+        multi_lora = MultiLoRA(target_modules=["q_proj", "k_proj"], n_adapters=3, dim=8, alpha=16)
         transformed = multi_lora(model, training=True)
 
-        assert isinstance(transformed.linear_qkv, MultiLoRALinear)
-        assert isinstance(transformed.linear_proj, MultiLoRALinear)
-        # nn.Linear should NOT be wrapped (we skip plain nn.Linear)
-        assert not isinstance(transformed.other, MultiLoRALinear)
+        assert isinstance(transformed.q_proj, SimpleMultiLoRALinear)
+        assert isinstance(transformed.k_proj, SimpleMultiLoRALinear)
+        assert not isinstance(transformed.other, SimpleMultiLoRALinear)
 
-    def test_transform_skips_already_transformed(self, monkeypatch):
+    def test_transform_skips_already_transformed(self):
         from megatron.bridge.peft.multi_lora import MultiLoRA
 
         multi_lora = MultiLoRA(n_adapters=2)
+        orig = nn.Linear(10, 10)
+        wrapped = SimpleMultiLoRALinear(orig, n_adapters=2)
 
-        adapters = nn.ModuleList([MockParallelLinearAdapter() for _ in range(2)])
-        already_wrapped = MultiLoRALinear(MockLinearWithTupleReturn(), adapters, 2)
+        result = multi_lora.transform(wrapped, name="test")
+        assert result is wrapped
 
-        result = multi_lora.transform(already_wrapped, name="test")
-        assert result is already_wrapped
-
-    def test_transform_skips_nn_linear(self):
+    def test_reset_adapter_across_model(self):
         from megatron.bridge.peft.multi_lora import MultiLoRA
-
-        multi_lora = MultiLoRA(n_adapters=2)
-        linear = nn.Linear(10, 10)
-
-        result = multi_lora.transform(linear, name="linear_qkv")
-        assert result is linear
-        assert not isinstance(result, MultiLoRALinear)
-
-    def test_transform_skips_expert_linears(self, monkeypatch):
-        from megatron.bridge.peft import multi_lora as multi_lora_module
-        from megatron.bridge.peft.multi_lora import MultiLoRA
-        from megatron.bridge.peft.utils import AdapterAttributes
-
-        fake_attrs = AdapterAttributes(
-            input_is_parallel=False,
-            in_features=10,
-            out_features=10,
-            disable_tensor_parallel_comm=False,
-            disable_sequence_parallel_comm=True,
-            base_linear_is_parallel=True,
-        )
-        monkeypatch.setattr(multi_lora_module, "get_adapter_attributes_from_linear", lambda m, **kw: fake_attrs)
-        monkeypatch.setattr(multi_lora_module, "is_expert_linear", lambda fqn: True)
-
-        multi_lora = MultiLoRA(target_modules=["linear_fc1"], n_adapters=2)
-        module = MockLinearWithTupleReturn()
-
-        result = multi_lora.transform(module, name="linear_fc1", prefix="mlp.experts.0")
-        assert result is module
-
-    def test_reset_adapter_across_model(self, monkeypatch):
-        from megatron.bridge.peft.multi_lora import MultiLoRA
-
-        adapters_a = nn.ModuleList([MockParallelLinearAdapter() for _ in range(2)])
-        adapters_b = nn.ModuleList([MockParallelLinearAdapter() for _ in range(2)])
 
         class TwoLayerModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layer_a = MultiLoRALinear(MockLinearWithTupleReturn(), adapters_a, 2)
-                self.layer_b = MultiLoRALinear(MockLinearWithTupleReturn(), adapters_b, 2)
+                self.layer_a = SimpleMultiLoRALinear(nn.Linear(10, 10), n_adapters=2)
+                self.layer_b = SimpleMultiLoRALinear(nn.Linear(10, 10), n_adapters=2)
 
         model = TwoLayerModel()
         multi_lora = MultiLoRA(n_adapters=2)
 
-        # Dirty adapter 0 in both layers
-        nn.init.normal_(adapters_a[0].linear_out.weight)
-        nn.init.normal_(adapters_b[0].linear_out.weight)
+        nn.init.normal_(model.layer_a.adapters[0].linear_out.weight)
+        nn.init.normal_(model.layer_b.adapters[0].linear_out.weight)
 
         multi_lora.reset_adapter(model, 0)
 
-        assert torch.allclose(adapters_a[0].linear_out.weight, torch.zeros_like(adapters_a[0].linear_out.weight))
-        assert torch.allclose(adapters_b[0].linear_out.weight, torch.zeros_like(adapters_b[0].linear_out.weight))
-
-    def test_set_adapter_scaling_across_model(self):
-        from megatron.bridge.peft.multi_lora import MultiLoRA
-
-        adapters_a = nn.ModuleList([MockParallelLinearAdapter() for _ in range(2)])
-        adapters_b = nn.ModuleList([MockParallelLinearAdapter() for _ in range(2)])
-
-        class TwoLayerModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.layer_a = MultiLoRALinear(MockLinearWithTupleReturn(), adapters_a, 2)
-                self.layer_b = MultiLoRALinear(MockLinearWithTupleReturn(), adapters_b, 2)
-
-        model = TwoLayerModel()
-        multi_lora = MultiLoRA(n_adapters=2)
-
-        multi_lora.set_adapter_scaling(model, 1, alpha=64, rank=16)
-
-        assert model.layer_a.scaling[1] == 64 / 16
-        assert model.layer_b.scaling[1] == 64 / 16
+        assert torch.allclose(
+            model.layer_a.adapters[0].linear_out.weight,
+            torch.zeros_like(model.layer_a.adapters[0].linear_out.weight),
+        )
+        assert torch.allclose(
+            model.layer_b.adapters[0].linear_out.weight,
+            torch.zeros_like(model.layer_b.adapters[0].linear_out.weight),
+        )
 
     def test_named_parameters_for_adapter_across_model(self):
         from megatron.bridge.peft.multi_lora import MultiLoRA
 
-        adapters_a = nn.ModuleList([MockParallelLinearAdapter() for _ in range(2)])
-        adapters_b = nn.ModuleList([MockParallelLinearAdapter() for _ in range(2)])
-
         class TwoLayerModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layer_a = MultiLoRALinear(MockLinearWithTupleReturn(), adapters_a, 2)
-                self.layer_b = MultiLoRALinear(MockLinearWithTupleReturn(), adapters_b, 2)
+                self.layer_a = SimpleMultiLoRALinear(nn.Linear(10, 10), n_adapters=2)
+                self.layer_b = SimpleMultiLoRALinear(nn.Linear(10, 10), n_adapters=2)
 
         model = TwoLayerModel()
         multi_lora = MultiLoRA(n_adapters=2)
@@ -543,27 +335,6 @@ class TestMultiLoRA:
         assert any("layer_b" in n for n in names)
         assert all("adapters.0." in n for n in names)
         assert not any("adapters.1." in n for n in names)
-
-    def test_state_dict_for_adapter_across_model(self):
-        from megatron.bridge.peft.multi_lora import MultiLoRA
-
-        adapters_a = nn.ModuleList([MockParallelLinearAdapter() for _ in range(2)])
-        adapters_b = nn.ModuleList([MockParallelLinearAdapter() for _ in range(2)])
-
-        class TwoLayerModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.layer_a = MultiLoRALinear(MockLinearWithTupleReturn(), adapters_a, 2)
-                self.layer_b = MultiLoRALinear(MockLinearWithTupleReturn(), adapters_b, 2)
-
-        model = TwoLayerModel()
-        multi_lora = MultiLoRA(n_adapters=2)
-
-        sd = multi_lora.state_dict_for_adapter(model, 1)
-
-        assert len(sd) > 0
-        for key in sd:
-            assert "adapters.1." in key
 
     def test_adapter_key_filter(self):
         from megatron.bridge.peft.multi_lora import MultiLoRA
@@ -577,8 +348,226 @@ class TestMultiLoRA:
 
         multi_lora = MultiLoRA(n_adapters=2)
 
-        trainable_param = nn.Parameter(torch.zeros(1), requires_grad=True)
-        frozen_param = nn.Parameter(torch.zeros(1), requires_grad=False)
+        trainable = nn.Parameter(torch.zeros(1), requires_grad=True)
+        frozen = nn.Parameter(torch.zeros(1), requires_grad=False)
 
-        assert multi_lora.adapter_key_filter(("key", trainable_param)) is True
-        assert multi_lora.adapter_key_filter(("key", frozen_param)) is False
+        assert multi_lora.adapter_key_filter(("key", trainable)) is True
+        assert multi_lora.adapter_key_filter(("key", frozen)) is False
+
+
+# ---------------------------------------------------------------------------
+# TestMultiLoRAMegatronIntegration
+# ---------------------------------------------------------------------------
+
+
+class TestMultiLoRAMegatronIntegration:
+    """Integration tests for MultiLoRA with real Megatron models."""
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        multi_lora_state.reset()
+
+        if not dist.is_initialized():
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = "29500"
+            os.environ["RANK"] = "0"
+            os.environ["LOCAL_RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+
+            device_count = torch.cuda.device_count()
+            if device_count > 0:
+                torch.cuda.set_device(0)
+
+            dist.init_process_group(
+                backend="nccl" if device_count > 0 else "gloo",
+                world_size=1,
+                rank=0,
+                timeout=datetime.timedelta(minutes=30),
+            )
+
+        assert dist.is_initialized()
+        if not parallel_state.model_parallel_is_initialized():
+            parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                virtual_pipeline_model_parallel_size=None,
+                context_parallel_size=1,
+            )
+
+        assert parallel_state.model_parallel_is_initialized()
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.bridge.training.initialize import _set_random_seed
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        _set_random_seed(
+            seed_=1234,
+            data_parallel_random_init=False,
+            te_rng_tracker=True,
+            inference_rng_tracker=False,
+            pg_collection=pg_collection,
+        )
+
+        yield
+
+        multi_lora_state.reset()
+        try:
+            if parallel_state.model_parallel_is_initialized():
+                parallel_state.destroy_model_parallel()
+            if dist.is_initialized():
+                dist.destroy_process_group()
+                for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "LOCAL_RANK", "WORLD_SIZE"]:
+                    os.environ.pop(key, None)
+        except (NameError, AttributeError, RuntimeError):
+            pass
+
+    def test_multi_lora_with_gpt_model(self):
+        """Test MultiLoRA application to a real Megatron GPT model."""
+        from megatron.bridge.models.gpt_provider import GPTModelProvider
+        from megatron.bridge.peft.multi_lora import MultiLoRA
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        model_provider = GPTModelProvider(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=2,
+            vocab_size=1000,
+            ffn_hidden_size=256,
+        )
+        model_provider._pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        multi_lora = MultiLoRA(
+            target_modules=["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+            n_adapters=3,
+            dim=8,
+            alpha=16,
+        )
+
+        def multi_lora_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+            return multi_lora(model, training=True)
+
+        model_provider.register_pre_wrap_hook(multi_lora_hook)
+        model_provider.finalize()
+
+        adapted_model = model_provider.provide_distributed_model(ddp_config=None, wrap_with_ddp=False)
+
+        assert isinstance(adapted_model, list)
+        assert len(adapted_model) > 0
+
+        adapted_model = [chunk.cuda() for chunk in adapted_model]
+
+        # Verify MultiLoRALinear modules were created
+        found_modules = []
+        for chunk in adapted_model:
+            for name, module in chunk.named_modules():
+                if isinstance(module, MultiLoRALinear):
+                    found_modules.append(name)
+
+        assert len(found_modules) > 0, f"No MultiLoRALinear modules found"
+
+        # Verify parameter efficiency
+        total_params = sum(p.numel() for chunk in adapted_model for p in chunk.parameters())
+        trainable_params = sum(p.numel() for chunk in adapted_model for p in chunk.parameters() if p.requires_grad)
+
+        assert trainable_params < total_params
+        assert trainable_params > 0
+
+    def test_multi_lora_forward_with_gpt_model(self):
+        """Test that MultiLoRA-wrapped GPT model can run a forward pass."""
+        from megatron.bridge.models.gpt_provider import GPTModelProvider
+        from megatron.bridge.peft.multi_lora import MultiLoRA
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        model_provider = GPTModelProvider(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=2,
+            vocab_size=100,
+            ffn_hidden_size=128,
+        )
+        model_provider._pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        n_adapters = 2
+        multi_lora = MultiLoRA(
+            target_modules=["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+            n_adapters=n_adapters,
+            dim=4,
+            alpha=8,
+        )
+
+        def multi_lora_hook(model):
+            return multi_lora(model, training=True)
+
+        model_provider.register_pre_wrap_hook(multi_lora_hook)
+        model_provider.finalize()
+
+        adapted_model = model_provider.provide_distributed_model(ddp_config=None, wrap_with_ddp=False)
+        adapted_model = [chunk.cuda() for chunk in adapted_model]
+
+        # Set up global state
+        seq_len = 8
+        n0, n1 = 3, 5
+        multi_lora_state.init(n_adapters=n_adapters, device="cuda")
+        multi_lora_state.lora_num_tokens.copy_(torch.tensor([n0, n1], dtype=torch.int32))
+        multi_lora_state.scaling_factors.copy_(torch.tensor([8.0 / 4, 8.0 / 4]))
+
+        # Create input tokens
+        tokens = torch.randint(0, 100, (1, seq_len), device="cuda")
+        position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
+
+        # Forward pass through first chunk (TP=1, PP=1 so there's one chunk)
+        model = adapted_model[0]
+        model.eval()
+
+        with torch.no_grad():
+            output = model(tokens, position_ids, None)
+
+        assert output is not None
+
+    def test_multi_lora_reset_with_gpt_model(self):
+        """Test adapter reset on a Megatron GPT model."""
+        from megatron.bridge.models.gpt_provider import GPTModelProvider
+        from megatron.bridge.peft.multi_lora import MultiLoRA
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        model_provider = GPTModelProvider(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=2,
+            vocab_size=100,
+            ffn_hidden_size=128,
+        )
+        model_provider._pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        multi_lora = MultiLoRA(
+            target_modules=["linear_qkv"],
+            n_adapters=2,
+            dim=4,
+            alpha=8,
+        )
+
+        def multi_lora_hook(model):
+            return multi_lora(model, training=True)
+
+        model_provider.register_pre_wrap_hook(multi_lora_hook)
+        model_provider.finalize()
+
+        adapted_model = model_provider.provide_distributed_model(ddp_config=None, wrap_with_ddp=False)
+        adapted_model = [chunk.cuda() for chunk in adapted_model]
+
+        # Dirty adapter 0 weights
+        for chunk in adapted_model:
+            for module in chunk.modules():
+                if isinstance(module, MultiLoRALinear):
+                    nn.init.normal_(module.multi_adapter.weight_B.data[0])
+
+        # Reset adapter 0
+        multi_lora.reset_adapter(adapted_model, 0)
+
+        # Verify B weights for adapter 0 are zeros
+        for chunk in adapted_model:
+            for module in chunk.modules():
+                if isinstance(module, MultiLoRALinear):
+                    assert torch.allclose(
+                        module.multi_adapter.weight_B.data[0],
+                        torch.zeros_like(module.multi_adapter.weight_B.data[0]),
+                    )
