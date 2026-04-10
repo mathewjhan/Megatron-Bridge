@@ -42,12 +42,12 @@ class TestMultiLoRAState:
 
     def test_init(self):
         multi_lora_state.init(n_adapters=3)
-        assert multi_lora_state.lora_num_tokens.shape == (3,)
+        assert multi_lora_state.tokens_per_adapter.shape == (3,)
         assert multi_lora_state.scaling_factors.shape == (3,)
 
     def test_get_before_init_raises(self):
         with pytest.raises(AssertionError):
-            multi_lora_state.get_lora_num_tokens()
+            multi_lora_state.get_tokens_per_adapter()
 
     def test_get_scaling_before_init_raises(self):
         with pytest.raises(AssertionError):
@@ -55,14 +55,14 @@ class TestMultiLoRAState:
 
     def test_in_place_update(self):
         multi_lora_state.init(n_adapters=3)
-        ptr = multi_lora_state.lora_num_tokens.data_ptr()
-        multi_lora_state.lora_num_tokens.copy_(torch.tensor([5, 0, 5], dtype=torch.int32))
-        assert multi_lora_state.lora_num_tokens.data_ptr() == ptr
+        ptr = multi_lora_state.tokens_per_adapter.data_ptr()
+        multi_lora_state.tokens_per_adapter.copy_(torch.tensor([5, 0, 5], dtype=torch.int32))
+        assert multi_lora_state.tokens_per_adapter.data_ptr() == ptr
 
     def test_reset(self):
         multi_lora_state.init(n_adapters=3)
         multi_lora_state.reset()
-        assert multi_lora_state.lora_num_tokens is None
+        assert multi_lora_state.tokens_per_adapter is None
         assert multi_lora_state.scaling_factors is None
 
 
@@ -96,7 +96,7 @@ class TestSimpleMultiLoRALinear:
         return SimpleMultiLoRALinear(orig_linear, n_adapters=self.N_ADAPTERS, dim=8, alpha=32)
 
     def _set_tokens(self, *counts):
-        multi_lora_state.lora_num_tokens.copy_(torch.tensor(counts, dtype=torch.int32))
+        multi_lora_state.tokens_per_adapter.copy_(torch.tensor(counts, dtype=torch.int32))
 
     # --- Init ---
 
@@ -507,7 +507,7 @@ class TestMultiLoRAMegatronIntegration:
         seq_len = 8
         n0, n1 = 3, 5
         multi_lora_state.init(n_adapters=n_adapters, device="cuda")
-        multi_lora_state.lora_num_tokens.copy_(torch.tensor([n0, n1], dtype=torch.int32))
+        multi_lora_state.tokens_per_adapter.copy_(torch.tensor([n0, n1], dtype=torch.int32))
         multi_lora_state.scaling_factors.copy_(torch.tensor([8.0 / 4, 8.0 / 4]))
 
         # Create input tokens

@@ -8,8 +8,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from megatron.bridge.peft.multi_lora import MultiLoRA
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleMultiLoRALinear
-from megatron.bridge.peft.multi_lora_state import set_lora_num_tokens, reset_state
+from megatron.bridge.peft.multi_lora_layers import SimpleMultiLoRALinear
+from megatron.bridge.peft.multi_lora_state import multi_lora_state
 
 N_ADAPTERS = 3
 MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
@@ -39,11 +39,14 @@ def main():
     total_params_after = sum(p.numel() for p in model.parameters())
     adapter_params = total_params_after - total_params_before
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    wrapped = sum(1 for m in model.modules() if isinstance(m, (MultiLoRALinear, SimpleMultiLoRALinear)))
+    wrapped = sum(1 for m in model.modules() if isinstance(m, SimpleMultiLoRALinear))
     print(f"Wrapped {wrapped} modules")
     print(f"Total params after: {total_params_after:,}")
     print(f"Adapter params: {adapter_params:,} ({N_ADAPTERS} adapters x {adapter_params // N_ADAPTERS:,} each)")
     print(f"Trainable params: {trainable:,}")
+
+    # Init global state
+    multi_lora_state.init(n_adapters=N_ADAPTERS, device=model.device, qkv_format="bshd")
 
     # Test forward with mixed adapters
     print("\n--- Forward test (mixed adapters) ---")
@@ -52,9 +55,12 @@ def main():
     seq_len = inputs["input_ids"].shape[1]
 
     n0, n1, n2 = 2, seq_len - 2, 0
-    set_lora_num_tokens(torch.tensor([n0, n1, n2], dtype=torch.int32), reset_reference=True)
+    multi_lora_state.set_batch(
+        tokens_per_adapter=torch.tensor([n0, n1, n2], dtype=torch.int32),
+        scaling_factors=torch.tensor([32.0 / 16] * N_ADAPTERS, dtype=torch.bfloat16),
+    )
     print(f"Input: '{text}' ({seq_len} tokens)")
-    print(f"lora_num_tokens: [{n0}, {n1}, {n2}]")
+    print(f"tokens_per_adapter: [{n0}, {n1}, {n2}]")
 
     with torch.no_grad():
         outputs = model(**inputs)
@@ -64,7 +70,9 @@ def main():
 
     # Test single adapter
     print("\n--- Forward test (single adapter 2) ---")
-    set_lora_num_tokens(torch.tensor([0, 0, seq_len], dtype=torch.int32))
+    multi_lora_state.set_batch(
+        tokens_per_adapter=torch.tensor([0, 0, seq_len], dtype=torch.int32),
+    )
     with torch.no_grad():
         outputs2 = model(**inputs)
     next_token2 = outputs2.logits[0, -1].argmax()
@@ -90,12 +98,7 @@ def main():
             break
         print(f"  {k}: {v.shape}")
 
-    # Test scaling
-    print("\n--- Set custom scaling for adapter 2 ---")
-    multi_lora.set_adapter_scaling(model, 2, alpha=64, rank=16)
-    print("Done")
-
-    reset_state()
+    multi_lora_state.reset()
     print("\nAll tests passed!")
 
 
