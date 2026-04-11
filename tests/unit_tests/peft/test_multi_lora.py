@@ -24,7 +24,7 @@ import torch.nn as nn
 import megatron.core.parallel_state as parallel_state
 from megatron.core.transformer.module import MegatronModule
 
-from megatron.bridge.peft.multi_lora_state import multi_lora_state
+from megatron.bridge.peft import multi_lora_state
 from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleMultiLoRALinear
 
 
@@ -43,7 +43,8 @@ class TestMultiLoRAState:
     def test_init(self):
         multi_lora_state.init(n_adapters=3)
         assert multi_lora_state.tokens_per_adapter.shape == (3,)
-        assert multi_lora_state.scaling_factors.shape == (3,)
+        assert multi_lora_state.alpha.shape == (3,)
+        assert multi_lora_state.rank.shape == (3,)
 
     def test_get_before_init_raises(self):
         with pytest.raises(AssertionError):
@@ -52,6 +53,13 @@ class TestMultiLoRAState:
     def test_get_scaling_before_init_raises(self):
         with pytest.raises(AssertionError):
             multi_lora_state.get_scaling_factors()
+
+    def test_scaling_factors_computed(self):
+        multi_lora_state.init(n_adapters=2)
+        multi_lora_state.alpha.copy_(torch.tensor([32.0, 16.0]))
+        multi_lora_state.rank.copy_(torch.tensor([8.0, 4.0]))
+        sf = multi_lora_state.get_scaling_factors()
+        assert torch.allclose(sf, torch.tensor([4.0, 4.0]))
 
     def test_in_place_update(self):
         multi_lora_state.init(n_adapters=3)
@@ -63,7 +71,8 @@ class TestMultiLoRAState:
         multi_lora_state.init(n_adapters=3)
         multi_lora_state.reset()
         assert multi_lora_state.tokens_per_adapter is None
-        assert multi_lora_state.scaling_factors is None
+        assert multi_lora_state.alpha is None
+        assert multi_lora_state.rank is None
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +89,8 @@ class TestSimpleMultiLoRALinear:
     def _reset(self):
         multi_lora_state.reset()
         multi_lora_state.init(n_adapters=self.N_ADAPTERS)
-        # Default scaling
-        multi_lora_state.scaling_factors.copy_(
-            torch.tensor([32.0 / 8] * self.N_ADAPTERS, dtype=multi_lora_state.scaling_factors.dtype)
-        )
+        multi_lora_state.alpha.copy_(torch.tensor([32.0] * self.N_ADAPTERS))
+        multi_lora_state.rank.copy_(torch.tensor([8.0] * self.N_ADAPTERS))
         yield
         multi_lora_state.reset()
 
@@ -183,9 +190,8 @@ class TestSimpleMultiLoRALinear:
 
     def test_scaling_from_global_state(self, multi_lora):
         nn.init.normal_(multi_lora.adapters[0].linear_out.weight)
-        multi_lora_state.scaling_factors.copy_(
-            torch.tensor([16.0, 4.0, 4.0], dtype=multi_lora_state.scaling_factors.dtype)
-        )
+        multi_lora_state.alpha.copy_(torch.tensor([128.0, 32.0, 32.0]))
+        multi_lora_state.rank.copy_(torch.tensor([8.0, 8.0, 8.0]))
 
         x = torch.randn(5, self.IN_FEATURES)
         self._set_tokens(5, 0, 0)
@@ -508,7 +514,8 @@ class TestMultiLoRAMegatronIntegration:
         n0, n1 = 3, 5
         multi_lora_state.init(n_adapters=n_adapters, device="cuda")
         multi_lora_state.tokens_per_adapter.copy_(torch.tensor([n0, n1], dtype=torch.int32))
-        multi_lora_state.scaling_factors.copy_(torch.tensor([8.0 / 4, 8.0 / 4]))
+        multi_lora_state.alpha.copy_(torch.tensor([8.0, 8.0]))
+        multi_lora_state.rank.copy_(torch.tensor([4.0, 4.0]))
 
         # Create input tokens
         tokens = torch.randint(0, 100, (1, seq_len), device="cuda")
@@ -558,7 +565,7 @@ class TestMultiLoRAMegatronIntegration:
         for chunk in adapted_model:
             for module in chunk.modules():
                 if isinstance(module, MultiLoRALinear):
-                    nn.init.normal_(module.multi_adapter.weight_B.data[0])
+                    nn.init.normal_(module.multi_adapter.weight_B[0].data)
 
         # Reset adapter 0
         multi_lora.reset_adapter(adapted_model, 0)
@@ -568,6 +575,6 @@ class TestMultiLoRAMegatronIntegration:
             for module in chunk.modules():
                 if isinstance(module, MultiLoRALinear):
                     assert torch.allclose(
-                        module.multi_adapter.weight_B.data[0],
-                        torch.zeros_like(module.multi_adapter.weight_B.data[0]),
+                        module.multi_adapter.weight_B[0].data,
+                        torch.zeros_like(module.multi_adapter.weight_B[0].data),
                     )

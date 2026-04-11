@@ -9,7 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from megatron.bridge.peft.multi_lora import MultiLoRA
 from megatron.bridge.peft.multi_lora_layers import SimpleMultiLoRALinear
-from megatron.bridge.peft.multi_lora_state import multi_lora_state
+from megatron.bridge.peft import multi_lora_state
 
 N_ADAPTERS = 3
 MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
@@ -46,7 +46,9 @@ def main():
     print(f"Trainable params: {trainable:,}")
 
     # Init global state
-    multi_lora_state.init(n_adapters=N_ADAPTERS, device=model.device, qkv_format="bshd")
+    multi_lora_state.init(n_adapters=N_ADAPTERS, device=model.device)
+    multi_lora_state.alpha.copy_(torch.tensor([32.0] * N_ADAPTERS, dtype=torch.bfloat16))
+    multi_lora_state.rank.copy_(torch.tensor([16.0] * N_ADAPTERS, dtype=torch.bfloat16))
 
     # Test forward with mixed adapters
     print("\n--- Forward test (mixed adapters) ---")
@@ -55,10 +57,7 @@ def main():
     seq_len = inputs["input_ids"].shape[1]
 
     n0, n1, n2 = 2, seq_len - 2, 0
-    multi_lora_state.set_batch(
-        tokens_per_adapter=torch.tensor([n0, n1, n2], dtype=torch.int32),
-        scaling_factors=torch.tensor([32.0 / 16] * N_ADAPTERS, dtype=torch.bfloat16),
-    )
+    multi_lora_state.set_batch(tokens_per_adapter=torch.tensor([n0, n1, n2], dtype=torch.int32))
     print(f"Input: '{text}' ({seq_len} tokens)")
     print(f"tokens_per_adapter: [{n0}, {n1}, {n2}]")
 
@@ -70,9 +69,7 @@ def main():
 
     # Test single adapter
     print("\n--- Forward test (single adapter 2) ---")
-    multi_lora_state.set_batch(
-        tokens_per_adapter=torch.tensor([0, 0, seq_len], dtype=torch.int32),
-    )
+    multi_lora_state.set_batch(tokens_per_adapter=torch.tensor([0, 0, seq_len], dtype=torch.int32))
     with torch.no_grad():
         outputs2 = model(**inputs)
     next_token2 = outputs2.logits[0, -1].argmax()

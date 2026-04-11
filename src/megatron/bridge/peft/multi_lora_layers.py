@@ -41,7 +41,7 @@ from megatron.core.tensor_parallel.mappings import (
 )
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
-from megatron.bridge.peft.multi_lora_state import multi_lora_state
+from megatron.bridge.peft import multi_lora_state
 from megatron.bridge.peft.utils import all2all_hp2sp
 
 
@@ -252,9 +252,9 @@ class MultiParallelLinearAdapter(nn.Module):
     per-adapter matmuls.  SP gather/scatter and TP all-gather/all-reduce
     are performed once around the grouped GEMMs.
 
-    Supports both ``thd`` (packed, input is ``[T, H]``) and ``bshd``
-    (padded batch, input is ``[B, S, H]``) formats via
-    :attr:`MultiLoRAState.qkv_format`.
+    Supports both ``thd`` (packed, input ``[T, H]``) and ``bshd``
+    (padded batch, input ``[B, S, H]``) — the forward flattens to 2D
+    before grouped GEMM regardless of format.
 
     Args:
         n_adapters: Number of adapter slots.
