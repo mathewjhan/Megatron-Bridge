@@ -53,10 +53,10 @@ class TestMultiLoRAState:
 
     def test_scaling_factors_computed(self):
         multi_lora_state.init(n_adapters=2, device=torch.device("cpu"))
-        multi_lora_state.alpha.copy_(torch.tensor([32.0, 16.0]))
-        multi_lora_state.rank.copy_(torch.tensor([8.0, 4.0]))
+        multi_lora_state.alpha.copy_(torch.tensor([32.0, 16.0], dtype=torch.bfloat16))
+        multi_lora_state.rank.copy_(torch.tensor([8.0, 4.0], dtype=torch.bfloat16))
         sf = multi_lora_state.get_scaling_factors()
-        assert torch.allclose(sf, torch.tensor([4.0, 4.0]))
+        assert torch.allclose(sf, torch.tensor([4.0, 4.0], dtype=torch.bfloat16))
 
     def test_reset(self):
         multi_lora_state.init(n_adapters=3, device=torch.device("cpu"))

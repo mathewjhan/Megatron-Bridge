@@ -18,8 +18,8 @@ def main():
     print(f"Loading {MODEL_NAME}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map="auto",
-    )
+        MODEL_NAME, torch_dtype=torch.bfloat16, trust_remote_code=True,
+    ).cuda()
     model.eval()
 
     total_params_before = sum(p.numel() for p in model.parameters())
