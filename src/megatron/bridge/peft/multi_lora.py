@@ -12,25 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-adapter LoRA PEFT class.
+"""Multi-adapter LoRA: transform, registry, and batch routing in one object.
 
-:class:`MultiLoRA` is the multi-adapter analogue of :class:`LoRA`.  It wraps
-each target module with a :class:`MultiLoRALinear` that holds *N* concurrent
-:class:`ParallelLinearAdapter` instances.
+:class:`MultiLoRA` is the single entry point for multi-LoRA.  It handles:
 
-Expert linears and ``TopKRouter`` modules are skipped — only dense attention
-projections and non-expert MLP layers are adapted.
+* **Model transform** — wrapping target modules with multi-adapter layers.
+* **Adapter registry** — name-based registration / unregistration of adapters.
+* **Batch routing** — setting per-batch token-to-adapter mappings.
+* **Weight lifecycle** — resetting, loading, saving per-adapter weights.
 
 Example::
 
     from megatron.bridge.peft.multi_lora import MultiLoRA
 
-    multi_lora = MultiLoRA(n_adapters=4, dim=32, alpha=32)
-    model = multi_lora(base_model, training=True)
+    multi_lora = MultiLoRA(n_adapters=4, dim=16, alpha=32)
+    model = multi_lora(model, training=True)
 
-    # Per-adapter optimizer
-    params = list(multi_lora.named_parameters_for_adapter(model, idx=0))
-    optimizer = torch.optim.Adam([p for _, p in params])
+    # Adapter lifecycle
+    multi_lora.register_adapter("math-lora", rank=16, alpha=32)
+    multi_lora.reset_adapter(model, "math-lora")
+
+    # Per-batch routing
+    multi_lora.set_batch({"math-lora": 512, "code-lora": 1024})
+
+    # Forward / backward as normal
+    output = model(tokens, position_ids, ...)
 """
 
 import logging
@@ -41,6 +47,7 @@ import torch
 import torch.nn as nn
 from megatron.core.transformer.moe.router import TopKRouter
 
+from megatron.bridge.peft import multi_lora_state
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, MultiParallelLinearAdapter, SimpleMultiLoRALinear
@@ -51,24 +58,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MultiLoRA(PEFT, ModuleMatcher):
-    """Multi-adapter LoRA supporting *N* concurrent adapters on a shared base model.
-
-    Each target module is wrapped with :class:`MultiLoRALinear` holding *N*
-    :class:`ParallelLinearAdapter` instances.  The active adapter is selected
-    at forward time via the global ``lora_num_tokens`` state.
+    """Multi-adapter LoRA: transform + registry + routing.
 
     Args:
         target_modules: Module names or wildcard patterns to apply multi-LoRA to.
-        n_adapters: Number of concurrent adapter slots.
+        n_adapters: Maximum number of concurrent adapter slots.
         dim: LoRA rank (bottleneck dimension).
-        alpha: LoRA scaling parameter.
+        alpha: Default LoRA scaling parameter for new adapters.
         dropout: Dropout probability for the adapter.
         dropout_position: Where to apply dropout (``'pre'`` or ``'post'``).
         lora_A_init_method: Initialisation method for the A matrix.
         lora_B_init_method: Initialisation method for the B matrix.
         a2a_experimental: Enable experimental all-to-all communication.
         lora_dtype: Data type for adapter weights (``None`` = use model dtype).
-        use_grouped_mm: Use experimental grouped GEMM forward path.
     """
 
     target_modules: List[str] = field(
@@ -84,23 +86,35 @@ class MultiLoRA(PEFT, ModuleMatcher):
     a2a_experimental: bool = False
     lora_dtype: Optional[torch.dtype] = None
 
-    # ------------------------------------------------------------------
-    # transform (called by walk for every module in the model)
-    # ------------------------------------------------------------------
+    # --- Internal registry state (not dataclass fields) ---
+
+    def __post_init__(self):
+        self._name_to_idx: Dict[str, int] = {}
+        self._idx_to_name: Dict[int, str] = {}
+        self._free_slots: set = set(range(self.n_adapters))
+        self._state_initialized = False
+
+    # ==================================================================
+    # Transform
+    # ==================================================================
+
+    def __call__(self, model, training=True):
+        model = super().__call__(model, training=training)
+        if not self._state_initialized:
+            device = self._detect_device(model)
+            multi_lora_state.init(self.n_adapters, device=device, dtype=self.lora_dtype or torch.bfloat16)
+            self._state_initialized = True
+        return model
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
-        # Skip already transformed modules
         if isinstance(module, (MultiLoRALinear, SimpleMultiLoRALinear)):
             return module
 
         if (ans := self.match(module, name, prefix)) is not None:
             (match, full_name) = ans
 
-            # Skip expert linears (expert × adapter routing is not supported)
             if is_expert_linear(full_name):
                 return module
-
-            # Skip TopKRouter
             if isinstance(module, TopKRouter):
                 return module
 
@@ -141,62 +155,166 @@ class MultiLoRA(PEFT, ModuleMatcher):
 
         return module
 
-    # ------------------------------------------------------------------
-    # Model-level adapter lifecycle
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Adapter Registry
+    # ==================================================================
 
-    def reset_adapter(self, model, idx: int) -> None:
-        """Re-initialise adapter *idx* across all :class:`MultiLoRALinear` layers."""
+    def register_adapter(self, name: str, rank: int, alpha: float) -> int:
+        """Register a named adapter, allocating a slot.
+
+        Args:
+            name: Unique adapter name (e.g. ``"math-lora"``).
+            rank: LoRA rank for this adapter.
+            alpha: LoRA alpha for this adapter.
+
+        Returns:
+            The allocated slot index.
+
+        Raises:
+            ValueError: If name is already registered or no free slots.
+        """
+        if name in self._name_to_idx:
+            raise ValueError(f"Adapter '{name}' is already registered at slot {self._name_to_idx[name]}")
+        if not self._free_slots:
+            raise ValueError(f"No free adapter slots (max {self.n_adapters})")
+
+        idx = min(self._free_slots)
+        self._free_slots.remove(idx)
+        self._name_to_idx[name] = idx
+        self._idx_to_name[idx] = name
+
+        multi_lora_state.alpha[idx] = alpha
+        multi_lora_state.rank[idx] = rank
+
+        logger.info(f"Registered adapter '{name}' at slot {idx} (rank={rank}, alpha={alpha})")
+        return idx
+
+    def unregister_adapter(self, name: str) -> int:
+        """Unregister a named adapter, freeing its slot.
+
+        Args:
+            name: Adapter name to unregister.
+
+        Returns:
+            The freed slot index.
+
+        Raises:
+            KeyError: If name is not registered.
+        """
+        idx = self._name_to_idx.pop(name)
+        del self._idx_to_name[idx]
+        self._free_slots.add(idx)
+
+        multi_lora_state.alpha[idx] = 0
+        multi_lora_state.rank[idx] = 1
+        multi_lora_state.tokens_per_adapter[idx] = 0
+
+        logger.info(f"Unregistered adapter '{name}' from slot {idx}")
+        return idx
+
+    def get_adapter_idx(self, name: str) -> int:
+        """Get the slot index for a named adapter."""
+        return self._name_to_idx[name]
+
+    @property
+    def registered_adapters(self) -> Dict[str, int]:
+        """Return a copy of the name → slot mapping."""
+        return dict(self._name_to_idx)
+
+    # ==================================================================
+    # Batch Routing
+    # ==================================================================
+
+    def set_batch(self, adapter_tokens: Dict[str, int]) -> None:
+        """Set per-batch token-to-adapter routing.
+
+        Tokens in the micro-batch must be sorted by adapter: all tokens for
+        the first adapter listed, then all tokens for the second, etc.
+
+        Args:
+            adapter_tokens: Mapping of adapter name → token count.
+                Order must match the token layout in the batch.
+        """
+        multi_lora_state.tokens_per_adapter.zero_()
+        for name, count in adapter_tokens.items():
+            idx = self._name_to_idx[name]
+            multi_lora_state.tokens_per_adapter[idx] = count
+
+    # ==================================================================
+    # Weight Lifecycle
+    # ==================================================================
+
+    def reset_adapter(self, model, name: str) -> None:
+        """Re-initialise adapter weights across all layers.
+
+        Args:
+            model: The transformed model (or list of model chunks).
+            name: Adapter name to reset.
+        """
+        idx = self._name_to_idx[name]
         for module in self._iter_multi_lora_modules(model):
             module.reset_adapter(idx)
 
-    def named_parameters_for_adapter(self, model, idx: int) -> Iterator[Tuple[str, nn.Parameter]]:
-        """Yield all parameters belonging to adapter *idx* across the model."""
+    def load_adapter(self, model, name: str, state_dict: Dict[str, torch.Tensor]) -> None:
+        """Load weights into a named adapter slot across all layers.
+
+        Args:
+            model: The transformed model (or list of model chunks).
+            name: Adapter name to load into.
+            state_dict: Adapter weights. Keys use the single-LoRA ``adapter.``
+                prefix (e.g. ``decoder.layers.0...adapter.linear_in.weight``).
+        """
+        idx = self._name_to_idx[name]
+        for module_name, module in self._named_multi_lora_modules(model):
+            adapter_prefix = f"{module_name}.adapter."
+            local_sd = {}
+            for key, value in state_dict.items():
+                if key.startswith(adapter_prefix):
+                    local_sd[key[len(adapter_prefix):]] = value
+            if local_sd:
+                module.load_adapter(idx, local_sd)
+
+    def named_parameters_for_adapter(self, model, name: str) -> Iterator[Tuple[str, nn.Parameter]]:
+        """Yield all parameters belonging to a named adapter.
+
+        Args:
+            model: The transformed model (or list of model chunks).
+            name: Adapter name.
+        """
+        idx = self._name_to_idx[name]
         for module_name, module in self._named_multi_lora_modules(model):
             for param_name, param in module.named_parameters_for_adapter(idx):
                 yield f"{module_name}.{param_name}", param
 
-    def state_dict_for_adapter(self, model, idx: int) -> Dict[str, torch.Tensor]:
-        """Collect state dict for adapter *idx* across the entire model."""
+    def state_dict_for_adapter(self, model, name: str) -> Dict[str, torch.Tensor]:
+        """Collect state dict for a named adapter across the model.
+
+        Args:
+            model: The transformed model (or list of model chunks).
+            name: Adapter name.
+        """
+        idx = self._name_to_idx[name]
         sd: Dict[str, torch.Tensor] = {}
         for module_name, module in self._named_multi_lora_modules(model):
             sd.update(module.state_dict_for_adapter(idx, prefix=f"{module_name}."))
         return sd
 
-    def load_adapter(self, model, idx: int, adapter_state_dict: Dict[str, torch.Tensor]) -> None:
-        """Load a single-adapter checkpoint into slot *idx*.
-
-        *adapter_state_dict* keys use the single-LoRA prefix ``adapter.``
-        (e.g. ``decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight``).
-        This method remaps them to the target :class:`MultiLoRALinear` module.
-        """
-        for module_name, module in self._named_multi_lora_modules(model):
-            adapter_prefix = f"{module_name}.adapter."
-            local_sd = {}
-            for key, value in adapter_state_dict.items():
-                if key.startswith(adapter_prefix):
-                    local_key = key[len(adapter_prefix) :]
-                    local_sd[local_key] = value
-            if local_sd:
-                module.load_adapter(idx, local_sd)
-
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Checkpoint filtering
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def adapter_key_filter(self, key) -> bool:
         if isinstance(key, tuple):
             return key[1].requires_grad
-        return ".adapters." in key
+        return ".adapters." in key or ".weight_A." in key or ".weight_B." in key
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Helpers
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     _multi_lora_types = (MultiLoRALinear, SimpleMultiLoRALinear)
 
     def _iter_multi_lora_modules(self, model) -> Iterator[nn.Module]:
-        """Yield all multi-LoRA modules in *model*."""
         models = model if isinstance(model, list) else [model]
         for model_chunk in models:
             for module in model_chunk.modules():
@@ -204,11 +322,16 @@ class MultiLoRA(PEFT, ModuleMatcher):
                     yield module
 
     def _named_multi_lora_modules(self, model) -> Iterator[Tuple[str, nn.Module]]:
-        """Yield ``(fqn, module)`` pairs for all multi-LoRA modules."""
         models = model if isinstance(model, list) else [model]
         for model_chunk in models:
             for name, module in model_chunk.named_modules():
                 if isinstance(module, self._multi_lora_types):
                     yield name, module
 
-
+    @staticmethod
+    def _detect_device(model) -> torch.device:
+        models = model if isinstance(model, list) else [model]
+        for model_chunk in models:
+            for param in model_chunk.parameters():
+                return param.device
+        return torch.device("cpu")

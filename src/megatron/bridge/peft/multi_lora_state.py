@@ -12,82 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-batch routing state for multi-LoRA.
+"""Low-level per-batch routing tensors for multi-LoRA.
 
-The downstream framework calls :func:`init` once at startup, then
-:func:`set_batch` before each forward pass.  Every multi-LoRA layer
-reads from the module-level state.
-
-Typical usage::
-
-    from megatron.bridge.peft import multi_lora_state
-
-    # One-time init
-    multi_lora_state.init(n_adapters=4, device="cuda")
-
-    # Before each micro-batch forward
-    multi_lora_state.set_batch(
-        tokens_per_adapter=torch.tensor([100, 50, 80, 0]),
-        alpha=torch.tensor([32.0, 32.0, 16.0, 16.0]),
-        rank=torch.tensor([16, 16, 8, 8]),
-    )
+These module-level tensors are written by :class:`MultiLoRA` and read by
+:class:`MultiLoRALinear` / :class:`MultiParallelLinearAdapter` during forward.
+Users should not interact with this module directly — use :class:`MultiLoRA`
+instead.
 """
 
 from typing import Optional
 
 import torch
 
-# Module-level state
+# Token counts per adapter slot, shape [n_adapters].
+# Defines contiguous token ranges in the flattened sequence.
 tokens_per_adapter: Optional[torch.Tensor] = None
+
+# Per-adapter LoRA alpha, shape [n_adapters].
 alpha: Optional[torch.Tensor] = None
+
+# Per-adapter LoRA rank, shape [n_adapters].
 rank: Optional[torch.Tensor] = None
 
 
-def init(
-    n_adapters: int,
-    device: torch.device = torch.device("cpu"),
-    dtype: torch.dtype = torch.bfloat16,
-) -> None:
-    """Allocate state tensors. Call once at startup."""
+def init(n_adapters: int, device: torch.device, dtype: torch.dtype = torch.bfloat16) -> None:
     global tokens_per_adapter, alpha, rank
     tokens_per_adapter = torch.zeros(n_adapters, dtype=torch.int32, device=device)
     alpha = torch.ones(n_adapters, dtype=dtype, device=device)
     rank = torch.ones(n_adapters, dtype=dtype, device=device)
 
 
-def set_batch(
-    new_tokens_per_adapter: torch.Tensor,
-    new_alpha: Optional[torch.Tensor] = None,
-    new_rank: Optional[torch.Tensor] = None,
-) -> None:
-    """Update routing state for the next micro-batch.
-
-    Args:
-        new_tokens_per_adapter: Token counts per adapter, shape ``[n_adapters]``.
-        new_alpha: Per-adapter LoRA alpha. If None, keeps current values.
-        new_rank: Per-adapter LoRA rank. If None, keeps current values.
-    """
-    assert tokens_per_adapter is not None, "multi_lora_state not initialized. Call init() first."
-    tokens_per_adapter.copy_(new_tokens_per_adapter)
-    if new_alpha is not None:
-        alpha.copy_(new_alpha)
-    if new_rank is not None:
-        rank.copy_(new_rank)
-
-
 def get_tokens_per_adapter() -> torch.Tensor:
-    assert tokens_per_adapter is not None, "multi_lora_state not initialized. Call init() first."
+    assert tokens_per_adapter is not None, "multi_lora_state not initialized"
     return tokens_per_adapter
 
 
 def get_scaling_factors() -> torch.Tensor:
-    """Compute ``alpha / rank`` per adapter."""
-    assert alpha is not None and rank is not None, "multi_lora_state not initialized. Call init() first."
+    assert alpha is not None and rank is not None, "multi_lora_state not initialized"
     return alpha / rank
 
 
 def reset() -> None:
-    """Clear all state. Useful in tests."""
     global tokens_per_adapter, alpha, rank
     tokens_per_adapter = None
     alpha = None

@@ -9,7 +9,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from megatron.bridge.peft.multi_lora import MultiLoRA
 from megatron.bridge.peft.multi_lora_layers import SimpleMultiLoRALinear
-from megatron.bridge.peft import multi_lora_state
 
 N_ADAPTERS = 3
 MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
@@ -26,7 +25,7 @@ def main():
     total_params_before = sum(p.numel() for p in model.parameters())
     print(f"Base model params: {total_params_before:,}")
 
-    # Apply multi-LoRA directly via MultiLoRA PEFT class
+    # Create MultiLoRA and transform model
     multi_lora = MultiLoRA(
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         n_adapters=N_ADAPTERS,
@@ -45,10 +44,11 @@ def main():
     print(f"Adapter params: {adapter_params:,} ({N_ADAPTERS} adapters x {adapter_params // N_ADAPTERS:,} each)")
     print(f"Trainable params: {trainable:,}")
 
-    # Init global state
-    multi_lora_state.init(n_adapters=N_ADAPTERS, device=model.device)
-    multi_lora_state.alpha.copy_(torch.tensor([32.0] * N_ADAPTERS, dtype=torch.bfloat16))
-    multi_lora_state.rank.copy_(torch.tensor([16.0] * N_ADAPTERS, dtype=torch.bfloat16))
+    # Register adapters
+    multi_lora.register_adapter("math-lora", rank=16, alpha=32)
+    multi_lora.register_adapter("code-lora", rank=16, alpha=32)
+    multi_lora.register_adapter("chat-lora", rank=16, alpha=32)
+    print(f"\nRegistered adapters: {multi_lora.registered_adapters}")
 
     # Test forward with mixed adapters
     print("\n--- Forward test (mixed adapters) ---")
@@ -56,10 +56,9 @@ def main():
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
     seq_len = inputs["input_ids"].shape[1]
 
-    n0, n1, n2 = 2, seq_len - 2, 0
-    multi_lora_state.set_batch(tokens_per_adapter=torch.tensor([n0, n1, n2], dtype=torch.int32))
+    multi_lora.set_batch({"math-lora": 2, "code-lora": seq_len - 2})
     print(f"Input: '{text}' ({seq_len} tokens)")
-    print(f"tokens_per_adapter: [{n0}, {n1}, {n2}]")
+    print(f"Batch: math-lora=2, code-lora={seq_len - 2}")
 
     with torch.no_grad():
         outputs = model(**inputs)
@@ -68,34 +67,43 @@ def main():
     print(f"Next token: '{tokenizer.decode(next_token)}'")
 
     # Test single adapter
-    print("\n--- Forward test (single adapter 2) ---")
-    multi_lora_state.set_batch(tokens_per_adapter=torch.tensor([0, 0, seq_len], dtype=torch.int32))
+    print("\n--- Forward test (single adapter: chat-lora) ---")
+    multi_lora.set_batch({"chat-lora": seq_len})
     with torch.no_grad():
         outputs2 = model(**inputs)
     next_token2 = outputs2.logits[0, -1].argmax()
     print(f"Next token: '{tokenizer.decode(next_token2)}'")
 
     # Test reset
-    print("\n--- Reset adapter 1 ---")
-    multi_lora.reset_adapter(model, 1)
+    print("\n--- Reset math-lora ---")
+    multi_lora.reset_adapter(model, "math-lora")
     print("Done")
 
     # Test per-adapter parameters
     print("\n--- Per-adapter parameter counts ---")
-    for idx in range(N_ADAPTERS):
-        params = list(multi_lora.named_parameters_for_adapter(model, idx))
-        print(f"  Adapter {idx}: {sum(p.numel() for _, p in params):,} params")
+    for name in multi_lora.registered_adapters:
+        params = list(multi_lora.named_parameters_for_adapter(model, name))
+        print(f"  {name}: {sum(p.numel() for _, p in params):,} params")
 
-    # Test state dict for adapter
-    print("\n--- State dict for adapter 0 (first 5 keys) ---")
-    sd = multi_lora.state_dict_for_adapter(model, 0)
+    # Test state dict
+    print("\n--- State dict for math-lora (first 5 keys) ---")
+    sd = multi_lora.state_dict_for_adapter(model, "math-lora")
     for i, (k, v) in enumerate(sd.items()):
         if i >= 5:
             print(f"  ... and {len(sd) - 5} more")
             break
         print(f"  {k}: {v.shape}")
 
-    multi_lora_state.reset()
+    # Test unregister
+    print("\n--- Unregister code-lora ---")
+    multi_lora.unregister_adapter("code-lora")
+    print(f"Remaining adapters: {multi_lora.registered_adapters}")
+
+    # Re-register in freed slot
+    print("\n--- Register writing-lora in freed slot ---")
+    multi_lora.register_adapter("writing-lora", rank=8, alpha=16)
+    print(f"Adapters: {multi_lora.registered_adapters}")
+
     print("\nAll tests passed!")
 
 
