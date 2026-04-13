@@ -225,15 +225,16 @@ class MultiLoRA(PEFT, ModuleMatcher):
     # Batch Routing
     # ==================================================================
 
-    def set_batch(self, adapter_tokens: Dict[str, int]) -> None:
+    def set_batch_tokens(self, adapter_tokens: Dict[str, int]) -> None:
         """Set per-batch token-to-adapter routing.
 
-        Tokens in the micro-batch must be sorted by adapter: all tokens for
-        the first adapter listed, then all tokens for the second, etc.
+        Tokens in the micro-batch must be sorted by adapter slot index:
+        all tokens for the lowest slot index first, then the next, etc.
+        The data pipeline should use :meth:`get_adapter_idx` at registration
+        time to know the slot ordering.
 
         Args:
             adapter_tokens: Mapping of adapter name → token count.
-                Order must match the token layout in the batch.
         """
         multi_lora_state.tokens_per_adapter.zero_()
         for name, count in adapter_tokens.items():

@@ -56,7 +56,7 @@ def main():
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
     seq_len = inputs["input_ids"].shape[1]
 
-    multi_lora.set_batch({"math-lora": 2, "code-lora": seq_len - 2})
+    multi_lora.set_batch_tokens({"math-lora": 2, "code-lora": seq_len - 2})
     print(f"Input: '{text}' ({seq_len} tokens)")
     print(f"Batch: math-lora=2, code-lora={seq_len - 2}")
 
@@ -68,7 +68,7 @@ def main():
 
     # Test single adapter
     print("\n--- Forward test (single adapter: chat-lora) ---")
-    multi_lora.set_batch({"chat-lora": seq_len})
+    multi_lora.set_batch_tokens({"chat-lora": seq_len})
     with torch.no_grad():
         outputs2 = model(**inputs)
     next_token2 = outputs2.logits[0, -1].argmax()

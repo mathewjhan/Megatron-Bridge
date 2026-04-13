@@ -166,7 +166,7 @@ class TestMultiLoRA:
     def test_set_batch(self, multi_lora, transformed_model):
         multi_lora.register_adapter("a", rank=8, alpha=16)
         multi_lora.register_adapter("b", rank=8, alpha=16)
-        multi_lora.set_batch({"a": 100, "b": 200})
+        multi_lora.set_batch_tokens({"a": 100, "b": 200})
 
         tpa = multi_lora_state.tokens_per_adapter
         idx_a = multi_lora.get_adapter_idx("a")
@@ -183,8 +183,8 @@ class TestMultiLoRA:
         multi_lora.register_adapter("a", rank=8, alpha=16)
         multi_lora.register_adapter("b", rank=8, alpha=16)
 
-        multi_lora.set_batch({"a": 100, "b": 200})
-        multi_lora.set_batch({"a": 50})
+        multi_lora.set_batch_tokens({"a": 100, "b": 200})
+        multi_lora.set_batch_tokens({"a": 50})
 
         idx_a = multi_lora.get_adapter_idx("a")
         idx_b = multi_lora.get_adapter_idx("b")
@@ -195,7 +195,7 @@ class TestMultiLoRA:
 
     def test_forward_single_adapter(self, multi_lora, transformed_model):
         multi_lora.register_adapter("a", rank=8, alpha=32)
-        multi_lora.set_batch({"a": 5})
+        multi_lora.set_batch_tokens({"a": 5})
 
         x = torch.randn(5, self.IN_FEATURES)
         output = transformed_model.q_proj(x)
@@ -206,7 +206,7 @@ class TestMultiLoRA:
         multi_lora.register_adapter("b", rank=8, alpha=32)
         nn.init.normal_(transformed_model.q_proj.adapters[multi_lora.get_adapter_idx("a")].linear_out.weight)
 
-        multi_lora.set_batch({"a": 3, "b": 2})
+        multi_lora.set_batch_tokens({"a": 3, "b": 2})
         x = torch.randn(5, self.IN_FEATURES)
         output = transformed_model.q_proj(x)
         assert output.shape == (5, self.OUT_FEATURES)
@@ -218,10 +218,10 @@ class TestMultiLoRA:
 
         x = torch.randn(5, self.IN_FEATURES)
 
-        multi_lora.set_batch({"a": 5})
+        multi_lora.set_batch_tokens({"a": 5})
         out_a = transformed_model.q_proj(x).clone()
 
-        multi_lora.set_batch({"b": 5})
+        multi_lora.set_batch_tokens({"b": 5})
         out_b = transformed_model.q_proj(x).clone()
 
         assert not torch.allclose(out_a, out_b)
@@ -388,7 +388,7 @@ class TestMultiLoRAMegatronIntegration:
         # Register adapters and set batch
         multi_lora.register_adapter("a", rank=4, alpha=8)
         multi_lora.register_adapter("b", rank=4, alpha=8)
-        multi_lora.set_batch({"a": 3, "b": 5})
+        multi_lora.set_batch_tokens({"a": 3, "b": 5})
 
         tokens = torch.randint(0, 100, (1, 8), device="cuda")
         position_ids = torch.arange(8, device="cuda").unsqueeze(0)
