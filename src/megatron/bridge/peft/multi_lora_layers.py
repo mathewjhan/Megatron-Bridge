@@ -16,7 +16,7 @@
 
 :class:`MultiLoRALinear` wraps a single Megatron parallel linear module with
 *N* concurrent LoRA adapters.  The active adapter is selected at forward time
-via the global :attr:`MultiLoRAState.tokens_per_adapter` (see :mod:`multi_lora_state`).
+via per-layer ``tokens_per_adapter`` set by :func:`set_batch`.
 
 Two forward implementations are provided:
 
@@ -41,7 +41,6 @@ from megatron.core.tensor_parallel.mappings import (
 )
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
-from megatron.bridge.peft import multi_lora_state
 from megatron.bridge.peft.utils import all2all_hp2sp
 
 
@@ -163,8 +162,14 @@ class SimpleMultiLoRALinear(nn.Linear):
         self.column_init_method = lora_A_init_method
         self.row_init_method = "zero"
         self._adapter_enabled = True
+        self.tokens_per_adapter: Optional[torch.Tensor] = None
+        self.scaling_factors: Optional[torch.Tensor] = None
+        self.max_rank = dim
 
         dtype = lora_dtype or orig_linear.weight.dtype
+        device = orig_linear.weight.device
+        self.alpha_values = torch.ones(n_adapters, dtype=dtype, device=device)
+        self.rank_values = torch.ones(n_adapters, dtype=dtype, device=device)
         self.adapters = nn.ModuleList([
             SimpleLoRAAdapter(
                 orig_linear.in_features,
@@ -192,7 +197,7 @@ class SimpleMultiLoRALinear(nn.Linear):
         if not self._adapter_enabled:
             return base_out
 
-        tokens_per_adapter = multi_lora_state.get_tokens_per_adapter()
+        tokens_per_adapter = self.tokens_per_adapter
         x_flat = x.reshape(-1, x.shape[-1])
         offsets = tokens_per_adapter.cumsum(dim=0)
         total = offsets[-1].item()
@@ -216,9 +221,7 @@ class SimpleMultiLoRALinear(nn.Linear):
 
         adapter_output = torch.cat(adapter_outputs, dim=0)
 
-        # Per-token scaling from global state
-        scaling_factors = multi_lora_state.get_scaling_factors()
-        per_token_scaling = torch.repeat_interleave(scaling_factors, tokens_per_adapter).unsqueeze(-1)
+        per_token_scaling = torch.repeat_interleave(self.scaling_factors, tokens_per_adapter).unsqueeze(-1)
         adapter_output = adapter_output * per_token_scaling
 
         return base_out + adapter_output.reshape(base_out.shape)
@@ -287,7 +290,12 @@ class MultiParallelLinearAdapter(nn.Module):
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
+        self.tokens_per_adapter: Optional[torch.Tensor] = None
+        self.scaling_factors: Optional[torch.Tensor] = None
+        self.max_rank = dim
         self.n_adapters = n_adapters
+        self.alpha_values = torch.ones(n_adapters, dtype=dtype or torch.bfloat16, device=device or torch.device("cpu"))
+        self.rank_values = torch.ones(n_adapters, dtype=dtype or torch.bfloat16, device=device or torch.device("cpu"))
         self.dim = dim
         self.alpha = alpha
         self.input_is_parallel = input_is_parallel
@@ -382,9 +390,7 @@ class MultiParallelLinearAdapter(nn.Module):
             else:
                 out = scatter_to_sequence_parallel_region(out)
 
-        # --- Per-token scaling from global state ---
-        scaling_factors = multi_lora_state.get_scaling_factors()
-        per_token_scaling = torch.repeat_interleave(scaling_factors, tokens_per_adapter).unsqueeze(-1)
+        per_token_scaling = torch.repeat_interleave(self.scaling_factors, tokens_per_adapter).unsqueeze(-1)
         out = out * per_token_scaling
 
         return out
@@ -431,6 +437,13 @@ class MultiLoRALinear(AdapterWrapper):
         self.multi_adapter = multi_adapter
         self._adapter_enabled = True
         self.n_adapters = n_adapters
+        self.tokens_per_adapter: Optional[torch.Tensor] = None
+        self.scaling_factors: Optional[torch.Tensor] = None
+        self.max_rank = multi_adapter.dim
+        device = next(to_wrap.parameters()).device
+        dtype = next(to_wrap.parameters()).dtype
+        self.alpha_values = torch.ones(n_adapters, dtype=dtype, device=device)
+        self.rank_values = torch.ones(n_adapters, dtype=dtype, device=device)
 
     # ------------------------------------------------------------------
     # Forward
@@ -444,7 +457,7 @@ class MultiLoRALinear(AdapterWrapper):
         if not self._adapter_enabled:
             return linear_output, bias
 
-        tokens_per_adapter = multi_lora_state.get_tokens_per_adapter()
+        tokens_per_adapter = self.tokens_per_adapter
         adapter_output = self.multi_adapter(layernorm_output.contiguous(), tokens_per_adapter)
         adapter_output = adapter_output.reshape(linear_output.shape)
         return linear_output + adapter_output, bias
@@ -494,3 +507,94 @@ class MultiLoRALinear(AdapterWrapper):
         for k, v in self.multi_adapter.state_dict(prefix=f"{prefix}multi_adapter.").items():
             sharded_sd[k] = v
         return sharded_sd
+
+
+# ==================================================================
+# Standalone functions for multi-LoRA batch routing and adapter I/O
+# ==================================================================
+
+_MULTI_LORA_TYPES = (MultiLoRALinear, SimpleMultiLoRALinear)
+
+
+def _iter_multi_lora_modules(model):
+    """Iterate over all MultiLoRA layer modules in a model."""
+    models = model if isinstance(model, list) else [model]
+    for model_chunk in models:
+        for module in model_chunk.modules():
+            if isinstance(module, _MULTI_LORA_TYPES):
+                yield module
+
+
+def set_batch(model, tokens_per_adapter: torch.Tensor) -> None:
+    """Set per-micro-batch routing on all MultiLoRA layers.
+
+    Computes scaling factors from each layer's own alpha/rank values.
+
+    Args:
+        model: The transformed model (or list of model chunks).
+        tokens_per_adapter: Tensor of shape [n_adapters] with token counts per slot.
+    """
+    for module in _iter_multi_lora_modules(model):
+        scaling = module.alpha_values / module.rank_values
+        module.tokens_per_adapter = tokens_per_adapter
+        module.scaling_factors = scaling
+        if isinstance(module, MultiLoRALinear):
+            module.multi_adapter.tokens_per_adapter = tokens_per_adapter
+            module.multi_adapter.scaling_factors = scaling
+
+
+def register_adapter(model, idx: int, rank: int, alpha: float) -> None:
+    """Register an adapter slot on all MultiLoRA layers.
+
+    Sets the alpha and rank for the given slot index.
+
+    Args:
+        model: The transformed model (or list of model chunks).
+        idx: Adapter slot index.
+        rank: LoRA rank for this adapter.
+        alpha: LoRA alpha for this adapter.
+    """
+    for module in _iter_multi_lora_modules(model):
+        module.alpha_values[idx] = alpha
+        module.rank_values[idx] = rank
+
+
+def unregister_adapter(model, idx: int) -> None:
+    """Unregister an adapter slot on all MultiLoRA layers.
+
+    Resets alpha/rank and re-initializes weights for the given slot.
+
+    Args:
+        model: The transformed model (or list of model chunks).
+        idx: Adapter slot index.
+    """
+    for module in _iter_multi_lora_modules(model):
+        module.alpha_values[idx] = 0
+        module.rank_values[idx] = 1
+        module.reset_adapter(idx)
+
+
+def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
+    """Load weights into a specific adapter slot across all MultiLoRA layers.
+
+    Args:
+        model: The transformed model (or list of model chunks).
+        idx: Adapter slot index to load into.
+        state_dict: Adapter weights keyed by module name with ``adapter.`` prefix.
+    """
+    for module_name, module in _named_multi_lora_modules(model):
+        adapter_prefix = f"{module_name}.adapter."
+        local_sd = {}
+        for key, value in state_dict.items():
+            if key.startswith(adapter_prefix):
+                local_sd[key[len(adapter_prefix):]] = value
+        if local_sd:
+            module.load_adapter(idx, local_sd)
+
+
+def _named_multi_lora_modules(model):
+    models = model if isinstance(model, list) else [model]
+    for model_chunk in models:
+        for name, module in model_chunk.named_modules():
+            if isinstance(module, _MULTI_LORA_TYPES):
+                yield name, module

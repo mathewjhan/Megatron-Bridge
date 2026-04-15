@@ -47,7 +47,6 @@ import torch
 import torch.nn as nn
 from megatron.core.transformer.moe.router import TopKRouter
 
-from megatron.bridge.peft import multi_lora_state
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, MultiParallelLinearAdapter, SimpleMultiLoRALinear
@@ -92,19 +91,10 @@ class MultiLoRA(PEFT, ModuleMatcher):
         self._name_to_idx: Dict[str, int] = {}
         self._idx_to_name: Dict[int, str] = {}
         self._free_slots: set = set(range(self.n_adapters))
-        self._state_initialized = False
 
     # ==================================================================
     # Transform
     # ==================================================================
-
-    def __call__(self, model, training=True):
-        model = super().__call__(model, training=training)
-        if not self._state_initialized:
-            device = self._detect_device(model)
-            multi_lora_state.init(self.n_adapters, device=device, dtype=self.lora_dtype or torch.bfloat16)
-            self._state_initialized = True
-        return model
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
         if isinstance(module, (MultiLoRALinear, SimpleMultiLoRALinear)):
@@ -183,9 +173,6 @@ class MultiLoRA(PEFT, ModuleMatcher):
         self._name_to_idx[name] = idx
         self._idx_to_name[idx] = name
 
-        multi_lora_state.alpha[idx] = alpha
-        multi_lora_state.rank[idx] = rank
-
         logger.info(f"Registered adapter '{name}' at slot {idx} (rank={rank}, alpha={alpha})")
         return idx
 
@@ -205,10 +192,6 @@ class MultiLoRA(PEFT, ModuleMatcher):
         del self._idx_to_name[idx]
         self._free_slots.add(idx)
 
-        multi_lora_state.alpha[idx] = 0
-        multi_lora_state.rank[idx] = 1
-        multi_lora_state.tokens_per_adapter[idx] = 0
-
         logger.info(f"Unregistered adapter '{name}' from slot {idx}")
         return idx
 
@@ -220,26 +203,6 @@ class MultiLoRA(PEFT, ModuleMatcher):
     def registered_adapters(self) -> Dict[str, int]:
         """Return a copy of the name → slot mapping."""
         return dict(self._name_to_idx)
-
-    # ==================================================================
-    # Batch Routing
-    # ==================================================================
-
-    def set_batch_tokens(self, adapter_tokens: Dict[str, int]) -> None:
-        """Set per-batch token-to-adapter routing.
-
-        Tokens in the micro-batch must be sorted by adapter slot index:
-        all tokens for the lowest slot index first, then the next, etc.
-        The data pipeline should use :meth:`get_adapter_idx` at registration
-        time to know the slot ordering.
-
-        Args:
-            adapter_tokens: Mapping of adapter name → token count.
-        """
-        multi_lora_state.tokens_per_adapter.zero_()
-        for name, count in adapter_tokens.items():
-            idx = self._name_to_idx[name]
-            multi_lora_state.tokens_per_adapter[idx] = count
 
     # ==================================================================
     # Weight Lifecycle
