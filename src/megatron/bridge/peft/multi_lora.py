@@ -29,8 +29,8 @@ from megatron.core.transformer.moe.router import TopKRouter
 
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, MultiParallelLinearAdapter, SimpleMultiLoRALinear
-from megatron.bridge.peft.utils import get_adapter_attributes_from_linear, is_expert_linear
+from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleMultiLoRALinear
+from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear, is_expert_linear
 
 logger = logging.getLogger(__name__)
 
@@ -93,22 +93,31 @@ class MultiLoRA(PEFT, ModuleMatcher):
             attrs = get_adapter_attributes_from_linear(module)
             logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to: {full_name}")
 
-            multi_adapter = MultiParallelLinearAdapter(
-                n_adapters=self.n_adapters,
-                in_features=attrs.in_features,
-                out_features=attrs.out_features,
-                dim=self.dim,
-                alpha=self.alpha,
+            adapters = nn.ModuleList([
+                ParallelLinearAdapter(
+                    in_features=attrs.in_features,
+                    out_features=attrs.out_features,
+                    dim=self.dim,
+                    base_linear_name=full_name,
+                    activation="identity",
+                    alpha=self.alpha,
+                    input_is_parallel=attrs.input_is_parallel,
+                    column_init_method=self.lora_A_init_method,
+                    row_init_method=self.lora_B_init_method,
+                    disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
+                    a2a_experimental=self.a2a_experimental,
+                    dropout=self.dropout,
+                    dropout_position=self.dropout_position,
+                )
+                for _ in range(self.n_adapters)
+            ])
+
+            return MultiLoRALinear(
+                module, adapters, self.n_adapters,
                 input_is_parallel=attrs.input_is_parallel,
-                column_init_method=self.lora_A_init_method,
-                row_init_method=self.lora_B_init_method,
                 disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
                 use_a2a=self.a2a_experimental,
-                dtype=next(module.parameters()).dtype,
-                device=next(module.parameters()).device,
             )
-
-            return MultiLoRALinear(module, multi_adapter, self.n_adapters)
 
         return module
 

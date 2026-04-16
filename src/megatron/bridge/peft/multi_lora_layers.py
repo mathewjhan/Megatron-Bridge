@@ -163,7 +163,6 @@ class SimpleMultiLoRALinear(nn.Linear):
         self.row_init_method = "zero"
         self._adapter_enabled = True
         self.tokens_per_adapter: Optional[torch.Tensor] = None
-        self.scaling_factors: Optional[torch.Tensor] = None
         self.max_rank = dim
 
         dtype = lora_dtype or orig_linear.weight.dtype
@@ -221,7 +220,8 @@ class SimpleMultiLoRALinear(nn.Linear):
 
         adapter_output = torch.cat(adapter_outputs, dim=0)
 
-        per_token_scaling = torch.repeat_interleave(self.scaling_factors, tokens_per_adapter).unsqueeze(-1)
+        scaling = self.alpha_values / self.rank_values
+        per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
         adapter_output = adapter_output * per_token_scaling
 
         return base_out + adapter_output.reshape(base_out.shape)
@@ -247,207 +247,42 @@ class SimpleMultiLoRALinear(nn.Linear):
         self.adapters[idx].load_state_dict(state_dict, strict=True)
 
 
-class MultiParallelLinearAdapter(nn.Module):
-    """Grouped GEMM multi-adapter with TP/SP comms done once, not N times.
-
-    Stores *N* adapters' weights as ``nn.ParameterList`` (one ``nn.Parameter``
-    per adapter per matrix) and uses ``torch._grouped_mm`` for fused
-    per-adapter matmuls.  SP gather/scatter and TP all-gather/all-reduce
-    are performed once around the grouped GEMMs.
-
-    Supports both ``thd`` (packed, input ``[T, H]``) and ``bshd``
-    (padded batch, input ``[B, S, H]``) — the forward flattens to 2D
-    before grouped GEMM regardless of format.
-
-    Args:
-        n_adapters: Number of adapter slots.
-        in_features: Full (unsharded) input features of the base linear.
-        out_features: Full (unsharded) output features of the base linear.
-        dim: LoRA rank.
-        alpha: LoRA scaling parameter.
-        input_is_parallel: Whether the base linear is RowParallel (input sharded).
-        column_init_method: Init method name for A weights.
-        row_init_method: Init method name for B weights.
-        disable_sequence_parallel_comm: Whether to skip SP gather/scatter.
-        use_a2a: Use all-to-all for SP scatter.
-        dtype: Parameter dtype.
-        device: Parameter device.
-    """
-
-    def __init__(
-        self,
-        n_adapters: int,
-        in_features: int,
-        out_features: int,
-        dim: int,
-        alpha: float = 32.0,
-        input_is_parallel: bool = False,
-        column_init_method: str = "xavier",
-        row_init_method: str = "zero",
-        disable_sequence_parallel_comm: bool = True,
-        use_a2a: bool = False,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        super().__init__()
-        self.tokens_per_adapter: Optional[torch.Tensor] = None
-        self.scaling_factors: Optional[torch.Tensor] = None
-        self.max_rank = dim
-        self.n_adapters = n_adapters
-        self.alpha_values = torch.ones(n_adapters, dtype=dtype or torch.bfloat16, device=device or torch.device("cpu"))
-        self.rank_values = torch.ones(n_adapters, dtype=dtype or torch.bfloat16, device=device or torch.device("cpu"))
-        self.dim = dim
-        self.alpha = alpha
-        self.input_is_parallel = input_is_parallel
-        self.disable_sequence_parallel_comm = disable_sequence_parallel_comm
-        self.use_a2a = use_a2a
-        self.column_init_method = column_init_method
-        self.row_init_method = row_init_method
-
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-
-        if input_is_parallel:
-            a_shape = (dim, in_features // tp_size)
-        else:
-            a_shape = (dim // tp_size, in_features)
-
-        b_shape = (out_features // tp_size, dim)
-
-        self.weight_A = nn.ParameterList([
-            nn.Parameter(torch.empty(*a_shape, dtype=dtype, device=device))
-            for _ in range(n_adapters)
-        ])
-        self.weight_B = nn.ParameterList([
-            nn.Parameter(torch.empty(*b_shape, dtype=dtype, device=device))
-            for _ in range(n_adapters)
-        ])
-
-        self._init_weights()
-
-        self._gather_output = input_is_parallel
-
-    def _init_weights(self) -> None:
-        from megatron.bridge.peft.utils import ParallelLinearAdapter
-        col_fn = ParallelLinearAdapter._get_init_fn(None, self.column_init_method)
-        row_fn = ParallelLinearAdapter._get_init_fn(None, self.row_init_method)
-        for i in range(self.n_adapters):
-            col_fn(self.weight_A[i].data)
-            row_fn(self.weight_B[i].data)
-
-    def reset_adapter(self, idx: int) -> None:
-        from megatron.bridge.peft.utils import ParallelLinearAdapter
-        col_fn = ParallelLinearAdapter._get_init_fn(None, self.column_init_method)
-        row_fn = ParallelLinearAdapter._get_init_fn(None, self.row_init_method)
-        col_fn(self.weight_A[idx].data)
-        row_fn(self.weight_B[idx].data)
-
-    def forward(self, x: torch.Tensor, tokens_per_adapter: torch.Tensor) -> torch.Tensor:
-        """Forward with grouped GEMM and proper TP/SP comms.
-
-        Args:
-            x: Input from layernorm.
-               ``thd``: shape ``[T, H]`` (or ``[T/TP, H]`` with SP).
-               ``bshd``: shape ``[B, S, H]``. Batch rows must be sorted by adapter.
-            tokens_per_adapter: Token counts per adapter, shape ``[N]``.
-               For ``bshd``, counts are in units of tokens (``n_seqs * seq_len``).
-
-        Returns:
-            Adapter output matching the shape of ``linear_output`` from the base layer.
-        """
-        ori_shape = x.shape
-        # --- SP gather (once) ---
-        if not self.disable_sequence_parallel_comm and not self.input_is_parallel:
-            x = gather_from_sequence_parallel_region(x)
-
-        # --- Flatten for grouped GEMM ---
-        x_flat = x.reshape(-1, x.shape[-1])
-        offsets = tokens_per_adapter.cumsum(dim=0, dtype=torch.int32)
-
-        # --- Stack weights for grouped GEMM ---
-        stacked_A = torch.stack(list(self.weight_A))
-        stacked_B = torch.stack(list(self.weight_B))
-
-        # --- Grouped GEMM: x @ A^T ---
-        mid = torch._grouped_mm(x_flat, stacked_A.transpose(-2, -1), offsets)
-
-        # --- TP comm between A and B ---
-        if self.input_is_parallel:
-            mid = reduce_from_tensor_model_parallel_region(mid)
-        else:
-            mid = gather_from_tensor_model_parallel_region(mid)
-
-        # --- Grouped GEMM: mid @ B^T ---
-        out = torch._grouped_mm(mid, stacked_B.transpose(-2, -1), offsets)
-
-        # --- TP comm for output ---
-        if self._gather_output:
-            out = gather_from_tensor_model_parallel_region(out)
-
-        # --- SP scatter (once) ---
-        if not self.disable_sequence_parallel_comm and self.input_is_parallel:
-            if self.use_a2a:
-                out = all2all_hp2sp(out)
-            else:
-                out = scatter_to_sequence_parallel_region(out)
-
-        per_token_scaling = torch.repeat_interleave(self.scaling_factors, tokens_per_adapter).unsqueeze(-1)
-        out = out * per_token_scaling
-
-        return out
-
-    def named_parameters_for_adapter(self, idx: int) -> Iterator[Tuple[str, nn.Parameter]]:
-        yield f"weight_A.{idx}", self.weight_A[idx]
-        yield f"weight_B.{idx}", self.weight_B[idx]
-
-    def state_dict_for_adapter(self, idx: int, prefix: str = "") -> Dict[str, Any]:
-        return {
-            f"{prefix}weight_A": self.weight_A[idx].data.clone(),
-            f"{prefix}weight_B": self.weight_B[idx].data.clone(),
-        }
-
-    def load_adapter(self, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
-        for key, value in state_dict.items():
-            if "weight_A" in key or "linear_in" in key:
-                self.weight_A[idx].data.copy_(value)
-            elif "weight_B" in key or "linear_out" in key:
-                self.weight_B[idx].data.copy_(value)
-
-
 class MultiLoRALinear(AdapterWrapper):
     """Megatron parallel linear wrapped with *N* concurrent LoRA adapters.
 
-    Extends :class:`AdapterWrapper`.  Uses a single
-    :class:`MultiParallelLinearAdapter` that stores stacked weights and
-    performs grouped GEMM with one set of TP/SP comms.
+    Each adapter slot is a :class:`ParallelLinearAdapter` stored in an
+    ``nn.ModuleList``. Forward uses grouped GEMM with a single set of
+    TP/SP comms for efficiency.
 
-    Args:
-        to_wrap: The base Megatron parallel linear module (frozen).
-        multi_adapter: :class:`MultiParallelLinearAdapter` holding all adapter weights.
-        n_adapters: Number of adapter slots.
+    For bridge export compatibility, use :func:`expose_adapter_slot` to
+    temporarily expose one slot as ``.adapter``.
     """
 
     def __init__(
         self,
         to_wrap: nn.Module,
-        multi_adapter: MultiParallelLinearAdapter,
+        adapters: nn.ModuleList,
         n_adapters: int,
+        input_is_parallel: bool = False,
+        disable_sequence_parallel_comm: bool = True,
+        use_a2a: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.to_wrap = to_wrap
-        self.multi_adapter = multi_adapter
+        self.adapters = adapters
         self._adapter_enabled = True
         self.n_adapters = n_adapters
+        self.input_is_parallel = input_is_parallel
+        self.disable_sequence_parallel_comm = disable_sequence_parallel_comm
+        self.use_a2a = use_a2a
+        self._gather_output = input_is_parallel
+
         self.tokens_per_adapter: Optional[torch.Tensor] = None
-        self.scaling_factors: Optional[torch.Tensor] = None
-        self.max_rank = multi_adapter.dim
+        self.max_rank = adapters[0].dim
         device = next(to_wrap.parameters()).device
         dtype = next(to_wrap.parameters()).dtype
         self.alpha_values = torch.ones(n_adapters, dtype=dtype, device=device)
         self.rank_values = torch.ones(n_adapters, dtype=dtype, device=device)
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def forward(
         self, x: torch.Tensor, *args: Any, **kwargs: Any
@@ -458,29 +293,55 @@ class MultiLoRALinear(AdapterWrapper):
             return linear_output, bias
 
         tokens_per_adapter = self.tokens_per_adapter
-        adapter_output = self.multi_adapter(layernorm_output.contiguous(), tokens_per_adapter)
-        adapter_output = adapter_output.reshape(linear_output.shape)
-        return linear_output + adapter_output, bias
+        x = layernorm_output.contiguous()
 
-    # ------------------------------------------------------------------
-    # Per-adapter lifecycle (delegates to multi_adapter)
-    # ------------------------------------------------------------------
+        # SP gather (once)
+        if not self.disable_sequence_parallel_comm and not self.input_is_parallel:
+            x = gather_from_sequence_parallel_region(x)
+
+        x_flat = x.reshape(-1, x.shape[-1])
+        offsets = tokens_per_adapter.cumsum(dim=0, dtype=torch.int32)
+
+        # Stack weights from individual adapters for grouped GEMM
+        stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
+        stacked_B = torch.stack([a.linear_out.weight for a in self.adapters])
+
+        # Grouped GEMM: x @ A^T
+        mid = torch._grouped_mm(x_flat, stacked_A.transpose(-2, -1), offsets)
+
+        # TP comm between A and B
+        if self.input_is_parallel:
+            mid = reduce_from_tensor_model_parallel_region(mid)
+        else:
+            mid = gather_from_tensor_model_parallel_region(mid)
+
+        # Grouped GEMM: mid @ B^T
+        out = torch._grouped_mm(mid, stacked_B.transpose(-2, -1), offsets)
+
+        # TP comm for output
+        if self._gather_output:
+            out = gather_from_tensor_model_parallel_region(out)
+
+        # SP scatter (once)
+        if not self.disable_sequence_parallel_comm and self.input_is_parallel:
+            if self.use_a2a:
+                out = all2all_hp2sp(out)
+            else:
+                out = scatter_to_sequence_parallel_region(out)
+
+        # Per-token scaling
+        scaling = self.alpha_values / self.rank_values
+        per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
+        out = out * per_token_scaling
+
+        return linear_output + out.reshape(linear_output.shape), bias
 
     def reset_adapter(self, idx: int) -> None:
-        self.multi_adapter.reset_adapter(idx)
-
-    def named_parameters_for_adapter(self, idx: int) -> Iterator[Tuple[str, nn.Parameter]]:
-        yield from self.multi_adapter.named_parameters_for_adapter(idx)
-
-    def state_dict_for_adapter(self, idx: int, prefix: str = "") -> Dict[str, Any]:
-        return self.multi_adapter.state_dict_for_adapter(idx, prefix=f"{prefix}multi_adapter.")
-
-    def load_adapter(self, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
-        self.multi_adapter.load_adapter(idx, state_dict)
-
-    # ------------------------------------------------------------------
-    # State dict (overrides AdapterWrapper)
-    # ------------------------------------------------------------------
+        from megatron.bridge.peft.utils import ParallelLinearAdapter
+        col_fn = ParallelLinearAdapter._get_init_fn(None, "xavier")
+        row_fn = ParallelLinearAdapter._get_init_fn(None, "zero")
+        col_fn(self.adapters[idx].linear_in.weight.data)
+        row_fn(self.adapters[idx].linear_out.weight.data)
 
     def state_dict(
         self,
@@ -491,7 +352,7 @@ class MultiLoRALinear(AdapterWrapper):
         if destination is None:
             destination = {}
         self.to_wrap.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
-        self.multi_adapter.state_dict(destination=destination, prefix=f"{prefix}multi_adapter.", keep_vars=keep_vars)
+        self.adapters.state_dict(destination=destination, prefix=f"{prefix}adapters.", keep_vars=keep_vars)
         return destination
 
     def sharded_state_dict(
@@ -502,22 +363,19 @@ class MultiLoRALinear(AdapterWrapper):
     ) -> Dict[str, Any]:
         sharded_sd: Dict[str, Any] = {}
         sharded_sd.update(self.to_wrap.sharded_state_dict(prefix, sharded_offsets, metadata))
-        # MultiParallelLinearAdapter stores raw Parameters, not Megatron parallel layers,
-        # so we use nn.Module.state_dict rather than sharded_state_dict.
-        for k, v in self.multi_adapter.state_dict(prefix=f"{prefix}multi_adapter.").items():
+        for k, v in self.adapters.state_dict(prefix=f"{prefix}adapters.").items():
             sharded_sd[k] = v
         return sharded_sd
 
 
 # ==================================================================
-# Standalone functions for multi-LoRA batch routing and adapter I/O
+# Standalone functions
 # ==================================================================
 
 _MULTI_LORA_TYPES = (MultiLoRALinear, SimpleMultiLoRALinear)
 
 
 def _iter_multi_lora_modules(model):
-    """Iterate over all MultiLoRA layer modules in a model."""
     models = model if isinstance(model, list) else [model]
     for model_chunk in models:
         for module in model_chunk.modules():
@@ -526,75 +384,47 @@ def _iter_multi_lora_modules(model):
 
 
 def set_batch(model, tokens_per_adapter: torch.Tensor) -> None:
-    """Set per-micro-batch routing on all MultiLoRA layers.
-
-    Computes scaling factors from each layer's own alpha/rank values.
-
-    Args:
-        model: The transformed model (or list of model chunks).
-        tokens_per_adapter: Tensor of shape [n_adapters] with token counts per slot.
-    """
+    """Set per-micro-batch routing on all MultiLoRA layers."""
     for module in _iter_multi_lora_modules(model):
-        scaling = module.alpha_values / module.rank_values
         module.tokens_per_adapter = tokens_per_adapter
-        module.scaling_factors = scaling
-        if isinstance(module, MultiLoRALinear):
-            module.multi_adapter.tokens_per_adapter = tokens_per_adapter
-            module.multi_adapter.scaling_factors = scaling
 
 
 def register_adapter(model, idx: int, rank: int, alpha: float) -> None:
-    """Register an adapter slot on all MultiLoRA layers.
-
-    Sets the alpha and rank for the given slot index.
-
-    Args:
-        model: The transformed model (or list of model chunks).
-        idx: Adapter slot index.
-        rank: LoRA rank for this adapter.
-        alpha: LoRA alpha for this adapter.
-    """
+    """Set alpha and rank for a slot on all MultiLoRA layers."""
     for module in _iter_multi_lora_modules(model):
         module.alpha_values[idx] = alpha
         module.rank_values[idx] = rank
 
 
 def unregister_adapter(model, idx: int) -> None:
-    """Unregister an adapter slot on all MultiLoRA layers.
-
-    Resets alpha/rank and re-initializes weights for the given slot.
-
-    Args:
-        model: The transformed model (or list of model chunks).
-        idx: Adapter slot index.
-    """
+    """Reset weights and alpha/rank for a slot on all MultiLoRA layers."""
     for module in _iter_multi_lora_modules(model):
         module.alpha_values[idx] = 0
         module.rank_values[idx] = 1
         module.reset_adapter(idx)
 
 
-def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
-    """Load weights into a specific adapter slot across all MultiLoRA layers.
+def expose_adapter_slot(model, idx: int):
+    """Context manager that temporarily exposes one adapter slot as ``.adapter``.
 
-    Args:
-        model: The transformed model (or list of model chunks).
-        idx: Adapter slot index to load into.
-        state_dict: Adapter weights keyed by module name with ``adapter.`` prefix.
+    This makes each MultiLoRALinear look like a standard single-LoRA module
+    to the bridge's export_adapter_weights, which looks for ``.adapter.linear_in.weight``.
     """
-    for module_name, module in _named_multi_lora_modules(model):
-        adapter_prefix = f"{module_name}.adapter."
-        local_sd = {}
-        for key, value in state_dict.items():
-            if key.startswith(adapter_prefix):
-                local_sd[key[len(adapter_prefix):]] = value
-        if local_sd:
-            module.load_adapter(idx, local_sd)
+    from contextlib import contextmanager
 
+    @contextmanager
+    def _ctx():
+        modules = list(_iter_multi_lora_modules(model))
+        saved = {}
+        for m in modules:
+            if isinstance(m, MultiLoRALinear):
+                saved[id(m)] = m._modules.pop("adapters")
+                m.adapter = saved[id(m)][idx]
+        yield
+        for m in modules:
+            if isinstance(m, MultiLoRALinear):
+                if "adapter" in m._modules:
+                    del m._modules["adapter"]
+                m._modules["adapters"] = saved[id(m)]
 
-def _named_multi_lora_modules(model):
-    models = model if isinstance(model, list) else [model]
-    for model_chunk in models:
-        for name, module in model_chunk.named_modules():
-            if isinstance(module, _MULTI_LORA_TYPES):
-                yield name, module
+    return _ctx()
