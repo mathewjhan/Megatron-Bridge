@@ -437,6 +437,18 @@ def expose_adapter_slot(model, idx: int):
             if isinstance(m, MultiLoRALinear):
                 saved[id(m)] = m._modules.pop("adapters")
                 m.adapter = saved[id(m)][idx]
+
+        # Debug: verify adapter params are visible
+        models = model if isinstance(model, list) else [model]
+        adapter_params = [n for n, _ in models[0].named_parameters() if ".adapter." in n]
+        print(f"[expose_adapter_slot] Visible adapter params: {len(adapter_params)}")
+        if adapter_params:
+            print(f"[expose_adapter_slot] First 5: {adapter_params[:5]}")
+        else:
+            all_params = [n for n, _ in models[0].named_parameters()]
+            lora_like = [n for n in all_params if "lora" in n.lower() or "adapter" in n.lower() or "linear_in" in n]
+            print(f"[expose_adapter_slot] No .adapter. params found! lora-like params: {lora_like[:5]}")
+
         yield
         for m in modules:
             if isinstance(m, MultiLoRALinear):
