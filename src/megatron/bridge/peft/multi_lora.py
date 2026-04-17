@@ -121,7 +121,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
 
             return MultiLoRALinear(
                 module, adapters, self.n_adapters,
-                input_is_parallel=attrs.input_is_parallel,
+                input_is_parallel=base_linear_is_parallel,
                 disable_sequence_parallel_comm=disable_sequence_parallel_comm,
                 use_a2a=self.a2a_experimental,
             )
