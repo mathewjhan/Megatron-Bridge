@@ -444,10 +444,21 @@ def expose_adapter_slot(model, idx: int):
         print(f"[expose_adapter_slot] Visible adapter params: {len(adapter_params)}")
         if adapter_params:
             print(f"[expose_adapter_slot] First 5: {adapter_params[:5]}")
-        else:
-            all_params = [n for n, _ in models[0].named_parameters()]
-            lora_like = [n for n in all_params if "lora" in n.lower() or "adapter" in n.lower() or "linear_in" in n]
-            print(f"[expose_adapter_slot] No .adapter. params found! lora-like params: {lora_like[:5]}")
+
+        # Debug: count MultiLoRALinear modules found and which have .adapter set
+        multi_lora_count = 0
+        has_adapter_count = 0
+        missing = []
+        for name, mod in models[0].named_modules():
+            if isinstance(mod, MultiLoRALinear):
+                multi_lora_count += 1
+                if hasattr(mod, "adapter") and "adapter" in mod._modules:
+                    has_adapter_count += 1
+                else:
+                    missing.append(name)
+        print(f"[expose_adapter_slot] MultiLoRALinear modules: {multi_lora_count}, with .adapter: {has_adapter_count}")
+        if missing:
+            print(f"[expose_adapter_slot] Missing .adapter on: {missing[:5]}")
 
         yield
         for m in modules:
