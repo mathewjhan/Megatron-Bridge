@@ -90,21 +90,28 @@ class MultiLoRA(PEFT, ModuleMatcher):
                     lora_dtype=self.lora_dtype,
                 )
 
-            attrs = get_adapter_attributes_from_linear(module)
+            (
+                input_is_parallel,
+                in_features,
+                out_features,
+                disable_tensor_parallel_comm,
+                disable_sequence_parallel_comm,
+                base_linear_is_parallel,
+            ) = get_adapter_attributes_from_linear(module)
             logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to: {full_name}")
 
             adapters = nn.ModuleList([
                 ParallelLinearAdapter(
-                    in_features=attrs.in_features,
-                    out_features=attrs.out_features,
+                    in_features=in_features,
+                    out_features=out_features,
                     dim=self.dim,
                     base_linear_name=full_name,
                     activation="identity",
                     alpha=self.alpha,
-                    input_is_parallel=attrs.input_is_parallel,
+                    input_is_parallel=input_is_parallel,
                     column_init_method=self.lora_A_init_method,
                     row_init_method=self.lora_B_init_method,
-                    disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
+                    disable_sequence_parallel_comm=disable_sequence_parallel_comm,
                     a2a_experimental=self.a2a_experimental,
                     dropout=self.dropout,
                     dropout_position=self.dropout_position,
@@ -115,7 +122,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
             return MultiLoRALinear(
                 module, adapters, self.n_adapters,
                 input_is_parallel=attrs.input_is_parallel,
-                disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
+                disable_sequence_parallel_comm=disable_sequence_parallel_comm,
                 use_a2a=self.a2a_experimental,
             )
 
