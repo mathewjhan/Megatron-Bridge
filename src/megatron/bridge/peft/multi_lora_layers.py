@@ -404,6 +404,23 @@ def unregister_adapter(model, idx: int) -> None:
         module.reset_adapter(idx)
 
 
+def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
+    """Load weights into a specific adapter slot across all MultiLoRA layers."""
+    for module in _iter_multi_lora_modules(model):
+        if isinstance(module, MultiLoRALinear):
+            adapter = module.adapters[idx]
+            adapter_sd = {}
+            for key, value in state_dict.items():
+                if "linear_in" in key or "lora_A" in key:
+                    adapter_sd["linear_in.weight"] = value
+                elif "linear_out" in key or "lora_B" in key:
+                    adapter_sd["linear_out.weight"] = value
+            if adapter_sd:
+                adapter.load_state_dict(adapter_sd, strict=False)
+        elif isinstance(module, SimpleMultiLoRALinear):
+            module.adapters[idx].load_state_dict(state_dict, strict=False)
+
+
 def expose_adapter_slot(model, idx: int):
     """Context manager that temporarily exposes one adapter slot as ``.adapter``.
 
