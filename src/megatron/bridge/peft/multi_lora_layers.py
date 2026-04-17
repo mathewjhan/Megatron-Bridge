@@ -428,3 +428,28 @@ def expose_adapter_slot(model, idx: int):
                 m._modules["adapters"] = saved[id(m)]
 
     return _ctx()
+
+
+def hide_adapters(model):
+    """Context manager that temporarily hides all adapter params from the model.
+
+    Used during base checkpoint loading so the bridge doesn't try to map
+    adapter parameters to HF weights.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        modules = list(_iter_multi_lora_modules(model))
+        saved = {}
+        for m in modules:
+            if isinstance(m, MultiLoRALinear) and "adapters" in m._modules:
+                saved[id(m)] = m._modules.pop("adapters")
+            elif isinstance(m, SimpleMultiLoRALinear) and "adapters" in m._modules:
+                saved[id(m)] = m._modules.pop("adapters")
+        yield
+        for m in modules:
+            if id(m) in saved:
+                m._modules["adapters"] = saved[id(m)]
+
+    return _ctx()
