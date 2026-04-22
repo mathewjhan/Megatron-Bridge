@@ -30,7 +30,7 @@ from megatron.core.transformer.moe.router import TopKRouter
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleMultiLoRALinear
-from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear, is_expert_linear
+from megatron.bridge.peft.utils import is_expert_linear
 
 logger = logging.getLogger(__name__)
 
@@ -90,40 +90,19 @@ class MultiLoRA(PEFT, ModuleMatcher):
                     lora_dtype=self.lora_dtype,
                 )
 
-            (
-                input_is_parallel,
-                in_features,
-                out_features,
-                disable_tensor_parallel_comm,
-                disable_sequence_parallel_comm,
-                base_linear_is_parallel,
-            ) = get_adapter_attributes_from_linear(module)
             logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to: {full_name}")
 
-            adapters = nn.ModuleList([
-                ParallelLinearAdapter(
-                    in_features=in_features,
-                    out_features=out_features,
-                    dim=self.dim,
-                    base_linear_name=full_name,
-                    activation="identity",
-                    alpha=self.alpha,
-                    input_is_parallel=input_is_parallel,
-                    column_init_method=self.lora_A_init_method,
-                    row_init_method=self.lora_B_init_method,
-                    disable_sequence_parallel_comm=disable_sequence_parallel_comm,
-                    a2a_experimental=self.a2a_experimental,
-                    dropout=self.dropout,
-                    dropout_position=self.dropout_position,
-                )
-                for _ in range(self.n_adapters)
-            ])
-
             return MultiLoRALinear(
-                module, adapters, self.n_adapters,
-                input_is_parallel=base_linear_is_parallel,
-                disable_sequence_parallel_comm=disable_sequence_parallel_comm,
-                use_a2a=self.a2a_experimental,
+                to_wrap=module,
+                n_adapters=self.n_adapters,
+                dim=self.dim,
+                alpha=self.alpha,
+                full_name=full_name,
+                column_init_method=self.lora_A_init_method,
+                row_init_method=self.lora_B_init_method,
+                dropout=self.dropout,
+                dropout_position=self.dropout_position,
+                a2a_experimental=self.a2a_experimental,
             )
 
         return module

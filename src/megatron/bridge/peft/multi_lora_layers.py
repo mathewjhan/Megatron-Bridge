@@ -41,7 +41,7 @@ from megatron.core.tensor_parallel.mappings import (
 )
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
-from megatron.bridge.peft.utils import all2all_hp2sp
+from megatron.bridge.peft.utils import ParallelLinearAdapter, all2all_hp2sp, get_adapter_attributes_from_linear
 
 
 class SimpleLoRAAdapter(nn.Module):
@@ -168,7 +168,7 @@ class SimpleMultiLoRALinear(nn.Linear):
         dtype = lora_dtype or orig_linear.weight.dtype
         device = orig_linear.weight.device
         self.alpha_values = torch.ones(n_adapters, dtype=dtype, device=device)
-        self.rank_values = torch.ones(n_adapters, dtype=dtype, device=device)
+        self.rank_values = torch.full((n_adapters,), dim, dtype=dtype, device=device)
         self.adapters = nn.ModuleList([
             SimpleLoRAAdapter(
                 orig_linear.in_features,
@@ -261,28 +261,62 @@ class MultiLoRALinear(AdapterWrapper):
     def __init__(
         self,
         to_wrap: nn.Module,
-        adapters: nn.ModuleList,
         n_adapters: int,
-        input_is_parallel: bool = False,
-        disable_sequence_parallel_comm: bool = True,
-        use_a2a: bool = False,
+        dim: int,
+        alpha: float,
+        full_name: str,
+        column_init_method: str = "xavier",
+        row_init_method: str = "zero",
+        dropout: float = 0.0,
+        dropout_position: str = "pre",
+        a2a_experimental: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.to_wrap = to_wrap
-        self.adapters = adapters
         self._adapter_enabled = True
         self.n_adapters = n_adapters
-        self.input_is_parallel = input_is_parallel
+        self.max_rank = dim
+
+        (
+            input_is_parallel,
+            in_features,
+            out_features,
+            _disable_tensor_parallel_comm,
+            disable_sequence_parallel_comm,
+            base_linear_is_parallel,
+        ) = get_adapter_attributes_from_linear(to_wrap)
+
+        self.input_is_parallel = base_linear_is_parallel
         self.disable_sequence_parallel_comm = disable_sequence_parallel_comm
-        self.use_a2a = use_a2a
-        self._gather_output = input_is_parallel
+        self.use_a2a = a2a_experimental
+        self._gather_output = base_linear_is_parallel
+
+        # ModuleList of ParallelLinearAdapters gives per-adapter optimizer state
+        # isolation, clean checkpoint serialization, and bridge export compatibility.
+        self.adapters = nn.ModuleList([
+            ParallelLinearAdapter(
+                in_features=in_features,
+                out_features=out_features,
+                dim=dim,
+                base_linear_name=full_name,
+                activation="identity",
+                alpha=alpha,
+                input_is_parallel=input_is_parallel,
+                column_init_method=column_init_method,
+                row_init_method=row_init_method,
+                disable_sequence_parallel_comm=disable_sequence_parallel_comm,
+                a2a_experimental=a2a_experimental,
+                dropout=dropout,
+                dropout_position=dropout_position,
+            )
+            for _ in range(n_adapters)
+        ])
 
         self.tokens_per_adapter: Optional[torch.Tensor] = None
-        self.max_rank = adapters[0].dim
         device = next(to_wrap.parameters()).device
         dtype = next(to_wrap.parameters()).dtype
         self.alpha_values = torch.ones(n_adapters, dtype=dtype, device=device)
-        self.rank_values = torch.ones(n_adapters, dtype=dtype, device=device)
+        self.rank_values = torch.full((n_adapters,), dim, dtype=dtype, device=device)
 
     def forward(
         self, x: torch.Tensor, *args: Any, **kwargs: Any
@@ -392,6 +426,9 @@ def set_batch(model, tokens_per_adapter: torch.Tensor) -> None:
 def register_adapter(model, idx: int, rank: int, alpha: float) -> None:
     """Set alpha and rank for a slot on all MultiLoRA layers."""
     for module in _iter_multi_lora_modules(model):
+        assert 0 < rank <= module.max_rank, (
+            f"Adapter rank {rank} must be in (0, {module.max_rank}]"
+        )
         module.alpha_values[idx] = alpha
         module.rank_values[idx] = rank
 
@@ -400,25 +437,48 @@ def unregister_adapter(model, idx: int) -> None:
     """Reset weights and alpha/rank for a slot on all MultiLoRA layers."""
     for module in _iter_multi_lora_modules(model):
         module.alpha_values[idx] = 0
-        module.rank_values[idx] = 1
+        module.rank_values[idx] = module.max_rank
         module.reset_adapter(idx)
 
 
 def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
-    """Load weights into a specific adapter slot across all MultiLoRA layers."""
+    """Load weights into a specific adapter slot across all MultiLoRA layers.
+
+    Supports loading adapters with rank <= max_rank. When rank < max_rank,
+    weights are zero-padded to max_rank. The rank dimension is always dim 0
+    for linear_in (A) and dim 1 for linear_out (B), regardless of TP type.
+    """
     for module in _iter_multi_lora_modules(model):
-        if isinstance(module, MultiLoRALinear):
-            adapter = module.adapters[idx]
-            adapter_sd = {}
-            for key, value in state_dict.items():
-                if "linear_in" in key or "lora_A" in key:
-                    adapter_sd["linear_in.weight"] = value
-                elif "linear_out" in key or "lora_B" in key:
-                    adapter_sd["linear_out.weight"] = value
-            if adapter_sd:
-                adapter.load_state_dict(adapter_sd, strict=False)
-        elif isinstance(module, SimpleMultiLoRALinear):
-            module.adapters[idx].load_state_dict(state_dict, strict=False)
+        adapter = module.adapters[idx]
+        for key, value in state_dict.items():
+            if "linear_in" in key or "lora_A" in key:
+                w = adapter.linear_in.weight.data
+                w.zero_()
+                w[:value.shape[0]] = value
+            elif "linear_out" in key or "lora_B" in key:
+                w = adapter.linear_out.weight.data
+                w.zero_()
+                w[:, :value.shape[1]] = value
+
+
+def apply_rank_masks(model, idx: Optional[int] = None) -> None:
+    """Re-zero weight dimensions beyond actual_rank for adapter slot(s).
+
+    Safety net for use after optimizer steps. The padded dimensions should
+    already be zero (gradients are self-reinforcing), but this guards against
+    numerical drift from optimizer internals.
+    """
+    for module in _iter_multi_lora_modules(model):
+        slots = range(module.n_adapters) if idx is None else [idx]
+        for i in slots:
+            actual_rank = int(module.rank_values[i].item())
+            if actual_rank >= module.max_rank:
+                continue
+            adapter = module.adapters[i]
+            r_in = actual_rank * adapter.linear_in.weight.shape[0] // module.max_rank
+            with torch.no_grad():
+                adapter.linear_in.weight.data[r_in:].zero_()
+                adapter.linear_out.weight.data[:, actual_rank:].zero_()
 
 
 def expose_adapter_slot(model, idx: int):
@@ -437,28 +497,6 @@ def expose_adapter_slot(model, idx: int):
             if isinstance(m, MultiLoRALinear):
                 saved[id(m)] = m._modules.pop("adapters")
                 m.adapter = saved[id(m)][idx]
-
-        # Debug: verify adapter params are visible
-        models = model if isinstance(model, list) else [model]
-        adapter_params = [n for n, _ in models[0].named_parameters() if ".adapter." in n]
-        print(f"[expose_adapter_slot] Visible adapter params: {len(adapter_params)}")
-        if adapter_params:
-            print(f"[expose_adapter_slot] First 5: {adapter_params[:5]}")
-
-        # Debug: count MultiLoRALinear modules found and which have .adapter set
-        multi_lora_count = 0
-        has_adapter_count = 0
-        missing = []
-        for name, mod in models[0].named_modules():
-            if isinstance(mod, MultiLoRALinear):
-                multi_lora_count += 1
-                if hasattr(mod, "adapter") and "adapter" in mod._modules:
-                    has_adapter_count += 1
-                else:
-                    missing.append(name)
-        print(f"[expose_adapter_slot] MultiLoRALinear modules: {multi_lora_count}, with .adapter: {has_adapter_count}")
-        if missing:
-            print(f"[expose_adapter_slot] Missing .adapter on: {missing[:5]}")
 
         yield
         for m in modules:
