@@ -431,6 +431,7 @@ def register_adapter(model, idx: int, rank: int, alpha: float) -> None:
         )
         module.alpha_values[idx] = alpha
         module.rank_values[idx] = rank
+    apply_rank_masks(model, idx)
 
 
 def unregister_adapter(model, idx: int) -> None:
