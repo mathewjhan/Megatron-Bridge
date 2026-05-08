@@ -249,6 +249,22 @@ class MegatronPeftBridge:
         # Some HF base names (e.g., Qwen3.5 MoE expert gate_up_proj) omit ".weight".
         return base_name + hf_suffix
 
+    def _get_grouped_expert_base_suffixes(self, num_moe_experts: int) -> List[str]:
+        """Return base suffixes used for grouped expert adapter export.
+
+        Default behavior iterates per-expert. Override for models whose grouped
+        expert adapters share a single 2D weight across all experts.
+        """
+        return [f".weight{i}" for i in range(num_moe_experts)]
+
+    def _prepare_expert_adapter_for_hf(self, tensor: torch.Tensor, is_grouped_expert: bool) -> torch.Tensor:
+        """Adjust adapter weight shape before yielding to HF format.
+
+        Default is identity (no-op). Override for models that need shape
+        adjustment for grouped expert adapters.
+        """
+        return tensor
+
     def _is_fused_qkv(self, hf_weight_names: Iterable[str]) -> bool:
         """Check whether the provided HF names correspond to a fused QKV weight."""
 
@@ -845,6 +861,8 @@ class MegatronPeftBridge:
 
             linear_in_tensor = adapter_weight.linear_in_weight.weight
             linear_out_tensor = adapter_weight.linear_out_weight.weight
+            megatron_linear_in_name = adapter_weight.linear_in_weight.param_name
+            megatron_linear_out_name = adapter_weight.linear_out_weight.param_name
             is_expert = is_expert_linear(adapter_task.global_base_prefix)
             is_grouped_expert = is_expert and ".local_experts." not in adapter_task.global_base_prefix
             expert_linear_in_gathered = None
@@ -859,13 +877,13 @@ class MegatronPeftBridge:
 
             base_suffixes = [".weight"]
             if is_grouped_expert:
-                base_suffixes = [f".weight{expert_num}" for expert_num in range(num_moe_experts)]
+                base_suffixes = self._get_grouped_expert_base_suffixes(num_moe_experts)
 
             # If the HF base names don't include experts.N, emit packed expert weights
             # (stacked along dim 0) once per HF name instead of duplicating per expert.
             packed_expert = False
             base_hf_weight_names: List[str] = []
-            if is_grouped_expert:
+            if is_grouped_expert and len(base_suffixes) > 1:
                 base_hf_weight_names = self._get_base_hf_param_names_for_adapter(
                     mapping_registry,
                     adapter_task.global_base_prefix,
@@ -911,15 +929,15 @@ class MegatronPeftBridge:
                     linear_out_stacked = linear_out_by_base[base_name]
                     if cpu:
                         linear_out_stacked = linear_out_stacked.cpu()
-                    yield HFWeightTuple(linear_in_hf_names[index], linear_in_stacked)
-                    yield HFWeightTuple(linear_out_hf_names[index], linear_out_stacked)
+                    yield HFWeightTuple(linear_in_hf_names[index], linear_in_stacked, megatron_linear_in_name)
+                    yield HFWeightTuple(linear_out_hf_names[index], linear_out_stacked, megatron_linear_out_name)
 
                 continue
 
             for base_suffix in base_suffixes:
                 current_linear_in_tensor = linear_in_tensor
                 current_linear_out_tensor = linear_out_tensor
-                if is_grouped_expert:
+                if is_grouped_expert and len(base_suffixes) > 1:
                     expert_idx = int(base_suffix[len(".weight") :])
                     current_linear_in_tensor = self._select_expert_adapter_weight(
                         linear_in_tensor,
@@ -967,12 +985,16 @@ class MegatronPeftBridge:
                                 "Return ABSENT_PROJECTION from _split_qkv_linear_out_weight "
                                 "to intentionally skip a projection."
                             )
-                            yield HFWeightTuple(linear_in_hf_names[index], current_linear_in_tensor)
-                            yield HFWeightTuple(linear_out_hf_names[index], current_linear_out_tensor)
+                            lin_in = self._prepare_expert_adapter_for_hf(current_linear_in_tensor, is_grouped_expert)
+                            lin_out = self._prepare_expert_adapter_for_hf(current_linear_out_tensor, is_grouped_expert)
+                            yield HFWeightTuple(linear_in_hf_names[index], lin_in, megatron_linear_in_name)
+                            yield HFWeightTuple(linear_out_hf_names[index], lin_out, megatron_linear_out_name)
                         continue
 
-                yield HFWeightTuple(linear_in_hf_names[0], current_linear_in_tensor)
-                yield HFWeightTuple(linear_out_hf_names[0], current_linear_out_tensor)
+                lin_in = self._prepare_expert_adapter_for_hf(current_linear_in_tensor, is_grouped_expert)
+                lin_out = self._prepare_expert_adapter_for_hf(current_linear_out_tensor, is_grouped_expert)
+                yield HFWeightTuple(linear_in_hf_names[0], lin_in, megatron_linear_in_name)
+                yield HFWeightTuple(linear_out_hf_names[0], lin_out, megatron_linear_out_name)
 
     def _get_fused_adapter_linear_out_slices(
         self,

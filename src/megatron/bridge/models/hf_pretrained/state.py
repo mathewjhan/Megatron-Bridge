@@ -747,7 +747,9 @@ class SafeTensorsStateSource(StateSource):
         all_expected_keys = set(key_to_filename_map.keys())
 
         if not key_to_filename_map:
-            buffered_tensors = dict(generator)
+            buffered_tensors = {}
+            for item in generator:
+                buffered_tensors[item.param_name] = item.weight
             if buffered_tensors:
                 save_file(buffered_tensors, output_path / "model.safetensors")
             return
@@ -761,7 +763,8 @@ class SafeTensorsStateSource(StateSource):
         all_yielded_keys = set()
         all_saved_keys = set()
 
-        for name, tensor in generator:
+        for item in generator:
+            name, tensor = item.param_name, item.weight
             all_yielded_keys.add(name)
             if name not in all_expected_keys:
                 if strict:
@@ -953,7 +956,8 @@ class SafeTensorsStateSource(StateSource):
         buffered_tensors: Dict[str, torch.Tensor] = {}
         actually_saved_keys: Set[str] = set()
 
-        for name, tensor in generator:
+        for item in generator:
+            name, tensor = item.param_name, item.weight
             all_yielded_keys.add(name)
 
             if name not in all_expected_keys:
