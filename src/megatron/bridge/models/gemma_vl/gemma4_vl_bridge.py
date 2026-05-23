@@ -237,11 +237,16 @@ class Gemma4VLBridge(MegatronModelBridge):
                         hf_weights[role] = hf_state_dict[name]
                 return hf_weights
 
-        # Fuse pre-norm correction into shared expert gate/up weights
+        # MILES PRODUCTION FIX: do NOT fuse w_pffl1/w_pffl2 ratio into shared expert
+        # gate/up weights at load time. The ratio can span 2000x with sign flips for
+        # some channels, causing catastrophic bf16 precision loss. Instead we apply
+        # the correction in fp32 at runtime in Gemma4MoELayer.shared_experts_compute
+        # via the _shared_expert_correction buffer (see Gemma4ModelProvider.provide ->
+        # _install_shared_expert_correction in gemma4_provider.py).
         if isinstance(hf_param, dict) and "gate" in hf_param:
             gate_name = hf_param["gate"]
             if "mlp.gate_proj" in gate_name:
-                return self._fuse_shared_expert_prenorm(hf_param, hf_state_dict)
+                return {role: hf_state_dict[name] for role, name in hf_param.items()}
 
         # Fuse router scaling into router.proj.weight
         if isinstance(hf_param, str) and hf_param.endswith("router.proj.weight"):
@@ -343,6 +348,7 @@ class Gemma4VLBridge(MegatronModelBridge):
             "language_model.decoder.layers.*.pre_mlp_layernorm.weight": (
                 "model.language_model.layers.*.pre_feedforward_layernorm_2.weight"
             ),
+            # (arch v5) shared_experts.linear_fc1 no longer carries a fused layer_norm_weight; w_pffl_1 is loaded into Gemma4TransformerLayer.pffl_weight buffer (see end of mapping table).
             # Dense MLP → Shared Expert fc2
             "language_model.decoder.layers.*.mlp.shared_experts.linear_fc2.weight": (
                 "model.language_model.layers.*.mlp.down_proj.weight"

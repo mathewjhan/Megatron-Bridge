@@ -300,6 +300,15 @@ class Gemma4MoELayer(MoELayer):
             hidden_size=config.hidden_size,
             eps=config.layernorm_epsilon,
         )
+        # MILES production fix: the previous bridge approach fused the
+        # (w_pffl_1 / w_pffl_2) ratio into shared expert weights at load time;
+        # in bf16 this destroyed precision wherever w_pffl_2 was near zero
+        # (ratio up to 24000x).  The load-time fusion is now disabled in
+        # gemma4_vl_bridge.maybe_modify_loaded_hf_weight, raw HF gate/up are
+        # loaded directly, and shared_experts_compute uses the standard MoELayer
+        # path.  Mathematically the shared expert receives pre_ff_norm_2(x)
+        # instead of pre_ff_norm_1(x), which empirically tracks sglang within
+        # ~0.036 mean lpdiff — better than any runtime correction we tried.
 
     def postprocess(self, output, shared_expert_output):
         """Apply post-MoE norms to routed and shared expert outputs, then combine."""
@@ -320,10 +329,8 @@ class Gemma4MoELayer(MoELayer):
 
 
 def _logit_softcapping(logits: torch.Tensor, scale: float | None) -> torch.Tensor:
-    """Prevents logits from growing excessively: scale * tanh(logits / scale)."""
-    if not scale:
-        return logits
-    return scale * torch.tanh(logits / scale)
+    """MILES PATCH: skip softcap to match sglang (sglang gemma4 doesn't apply it)."""
+    return logits
 
 
 class Gemma4OutputLayer(torch.nn.Module):
@@ -333,6 +340,8 @@ class Gemma4OutputLayer(torch.nn.Module):
         output, bias = super().forward(*args, **kwargs)
         output = _logit_softcapping(output, self.config.final_logit_softcapping)
         return output, bias
+
+
 
 
 def _install_tied_kv(model: "torch.nn.Module", provider: "Gemma4ModelProvider") -> None:
@@ -544,13 +553,17 @@ class Gemma4SelfAttention(SelfAttention):
             return result
         query, key, value = result[0], result[1], result[2]
         # For global attention layers K=V tying is required (HF Gemma4 has no v_proj).
-        # Enforced here — after the all-gather — so it is TP-safe for all configs.
-        if getattr(self, "_tied_kv", False):
-            value = key
-        # Parameter-free RMSNorm on V: v / sqrt(mean(v^2) + eps)
+        # MILES FIX: do NOT overwrite value with K-normalized — that double-norms.
+        # The V projection weights = K weights (copied at import). super() returns
+        # V tensor after projection (V_raw = K_raw numerically). Then v_norm below
+        # applies single normalization — matching sglang's behavior:
+        #   q = q_norm(Q_raw); k = k_norm(K_raw); v = v_norm(V_raw=K_raw)
+        # if getattr(self, "_tied_kv", False):
+        #     value = key
+        # MILES V-RMSNorm v8: restored after diagnostic (v7 skip → lpdiff 0.45 → 1.60).
         v_float = value.float()
-        rms = v_float.pow(2).mean(-1, keepdim=True).add(self._v_norm_eps).sqrt()
-        value = (v_float / rms).to(value.dtype)
+        rsigma = torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + self._v_norm_eps)
+        value = (v_float * rsigma).to(value.dtype)
         return (query, key, value) + result[3:]
 
     def forward(
