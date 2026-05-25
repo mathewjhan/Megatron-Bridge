@@ -99,7 +99,9 @@ def quantize_to_int4(
         weight_shape: Original tensor shape (int32)
     """
     out_features, in_features = weight.shape
-    weight_shape = torch.tensor([out_features, in_features], dtype=torch.int32)
+    weight_shape = torch.tensor(
+        [out_features, in_features], dtype=torch.int32, device=weight.device
+    )
 
     # Convert to float32 for computation
     w = weight.float()
