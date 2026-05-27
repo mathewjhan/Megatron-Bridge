@@ -783,21 +783,31 @@ class Gemma4RotaryEmbedding(RotaryEmbedding):
     ):
         # Global RoPE: proportional partial rotary with high theta
         global_kwargs = {k: v for k, v in kwargs.items() if k not in ("rotary_percent", "kv_channels")}
+        # rotary_percent=1.0: HF applies global RoPE over the FULL head via rotate_half
+        # (dim i <-> dim i+head_dim/2); partial-rotary is realized by zeroing the high
+        # frequencies below, NOT by rotating only the first rotary_dim dims.
         super().__init__(
             kv_channels=global_kv_channels,
             rotary_base=rotary_base,
-            rotary_percent=global_rotary_percent,
+            rotary_percent=1.0,
             **global_kwargs,
         )
 
         # Fix global inv_freq to match HF's proportional RoPE formula.
         # HF proportional: inv_freq = 1/(base^(arange / head_dim)) not 1/(base^(arange / dim))
         # where dim = int(head_dim * percent) and head_dim = global_kv_channels
-        dim = int(global_kv_channels * global_rotary_percent)  # 128
+        # HF 'proportional' global RoPE: inv_freq has global_head_dim/2 entries, but only the
+        # first (rotary_dim/2) are non-zero; the rest are 0 so those dims pass through unrotated.
+        # Combined with rotary_percent=1.0 above, this reproduces HF's exact rotated-dim layout
+        # ({0..rotary_dim/2-1} paired with {head_dim/2 .. head_dim/2+rotary_dim/2-1}).
+        dim = int(global_kv_channels * global_rotary_percent)  # rotary dim = 128
         device = self.inv_freq.device
-        self.inv_freq = 1.0 / (
+        _nz = 1.0 / (
             rotary_base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / global_kv_channels)
-        )
+        )  # 64 non-zero freqs
+        _inv = torch.zeros(global_kv_channels // 2, dtype=torch.float32, device=device)  # 256
+        _inv[: _nz.numel()] = _nz
+        self.inv_freq = _inv
 
         # Local RoPE: full rotary with low theta
         self.rope_local = RotaryEmbedding(
