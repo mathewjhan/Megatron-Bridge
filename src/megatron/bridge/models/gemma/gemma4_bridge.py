@@ -293,13 +293,12 @@ class Gemma4Bridge(MegatronModelBridge):
                         hf_weights[role] = hf_state_dict[name]
                 return hf_weights
 
-        # MILES DIAGNOSTIC: skip shared expert pre-norm fusion to test if fusion bf16 precision is the lpdiff source
+        # Load shared-expert gate/up weights raw (no pre-norm fusion): HF Gemma-4
+        # applies the pre-norm at runtime (dual pre-norm), and fusing the w2 norm
+        # into bf16 weights blows up on the ~5% near-zero channels.
         if isinstance(hf_param, dict) and "gate" in hf_param:
             gate_name = hf_param["gate"]
             if "mlp.gate_proj" in gate_name:
-                import sys
-                print(f"[MILES_FUSION_SKIP] returning raw weights for {gate_name}", file=sys.stderr, flush=True)
-                # return self._fuse_shared_expert_prenorm(hf_param, hf_state_dict)
                 return {role: hf_state_dict[name] for role, name in hf_param.items()}
 
         # Fuse router scaling into router.proj.weight

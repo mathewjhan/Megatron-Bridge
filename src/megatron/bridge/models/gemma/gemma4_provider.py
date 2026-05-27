@@ -449,8 +449,16 @@ class Gemma4MoELayer(MoELayer):
 
 
 def _logit_softcapping(logits: torch.Tensor, scale: float | None) -> torch.Tensor:
-    """MILES PATCH: skip softcap to match sglang (sglang gemma4 doesn't apply it)."""
-    return logits
+    """Apply HF final_logit_softcapping: scale * tanh(logits / scale).
+
+    The true HF Gemma-4 model AND sglang's LogitsProcessor both apply this
+    (config.final_logit_softcapping=30.0). A prior MILES patch skipped it on a
+    wrong premise; that made the bridge's logits over-extreme on tail tokens vs
+    sglang/HF and inflated train_rollout_logprob_abs_diff.
+    """
+    if scale is None:
+        return logits
+    return scale * torch.tanh(logits / scale)
 
 
 class Gemma4OutputLayer(torch.nn.Module):
