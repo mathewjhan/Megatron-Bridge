@@ -179,35 +179,10 @@ class Gemma4VLBridge(MegatronModelBridge):
             # ── Router weight inverse: mg = hf * (scale * hidden^-0.5 / pffl2)
             #                         hf = mg / (scale * hidden^-0.5 / pffl2)
             #                            = mg * pffl2 / (scale * hidden^-0.5)
-            if hf_name.endswith("router.proj.weight"):
-                layer_match = re.search(r"layers\.(\d+)\.", hf_name)
-                if layer_match:
-                    layer_idx = layer_match.group(1)
-                    prefix = hf_name.rsplit("layers.", 1)[0]
-                    scale_key = f"{prefix}layers.{layer_idx}.router.scale"
-                    ln2_key = f"{prefix}layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
-                    if scale_key in hf_state_dict and ln2_key in hf_state_dict:
-                        router_scale = hf_state_dict[scale_key].float().to(tensor.device)
-                        ln2_weight = hf_state_dict[ln2_key].float().to(tensor.device)
-                        hidden_size = tensor.shape[-1]
-                        scalar_root_size = hidden_size**-0.5
-                        fusion_factor = router_scale * scalar_root_size / ln2_weight  # [hidden]
-                        tensor = (tensor.float() / fusion_factor.unsqueeze(0)).to(tensor.dtype)
+            # Router proj is loaded raw (no fusion), so no inverse correction on export.
 
-            # ── Shared-expert gate/up inverse: mg = hf * (pffl / pffl2)
-            #                                  hf = mg * (pffl2 / pffl)
-            elif hf_name.endswith(("mlp.gate_proj.weight", "mlp.up_proj.weight")) and "experts" not in hf_name:
-                layer_match = re.search(r"layers\.(\d+)\.", hf_name)
-                if layer_match:
-                    layer_idx = layer_match.group(1)
-                    prefix = hf_name.rsplit("layers.", 1)[0]
-                    pffl_key = f"{prefix}layers.{layer_idx}.pre_feedforward_layernorm.weight"
-                    pffl2_key = f"{prefix}layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
-                    if pffl_key in hf_state_dict and pffl2_key in hf_state_dict:
-                        w_pffl = hf_state_dict[pffl_key].float().to(tensor.device)
-                        w_pffl2 = hf_state_dict[pffl2_key].float().to(tensor.device)
-                        correction = w_pffl / w_pffl2  # [hidden]
-                        tensor = (tensor.float() / correction.unsqueeze(0)).to(tensor.dtype)
+            # Note: shared-expert gate/up are loaded raw (no fusion in maybe_modify_loaded_hf_weight),
+            # so no inverse correction on export.
 
             result[hf_name] = tensor
 
@@ -237,20 +212,22 @@ class Gemma4VLBridge(MegatronModelBridge):
                         hf_weights[role] = hf_state_dict[name]
                 return hf_weights
 
-        # MILES PRODUCTION FIX: do NOT fuse w_pffl1/w_pffl2 ratio into shared expert
-        # gate/up weights at load time. The ratio can span 2000x with sign flips for
-        # some channels, causing catastrophic bf16 precision loss. Instead we apply
-        # the correction in fp32 at runtime in Gemma4MoELayer.shared_experts_compute
-        # via the _shared_expert_correction buffer (see Gemma4ModelProvider.provide ->
-        # _install_shared_expert_correction in gemma4_provider.py).
+        # Shared-expert gate/up are loaded RAW. Dual pre-norm in Gemma4MoELayer
+        # (pre_shared_layernorm = w_pffl_1, pre_moe_layernorm = w_pffl_2) gives the
+        # shared expert HF-correct input without any weight fusion. Earlier bridge
+        # revisions fused (w_pffl_1 / w_pffl_2) into gate/up at load time; in bf16
+        # this destroyed precision wherever w_pffl_2 was near zero (ratio up to
+        # 24000x with sign flips on ~5% of channels).
         if isinstance(hf_param, dict) and "gate" in hf_param:
             gate_name = hf_param["gate"]
             if "mlp.gate_proj" in gate_name:
                 return {role: hf_state_dict[name] for role, name in hf_param.items()}
 
-        # Fuse router scaling into router.proj.weight
-        if isinstance(hf_param, str) and hf_param.endswith("router.proj.weight"):
-            return self._fuse_router_weight(hf_param, hf_state_dict)
+        # Router proj is loaded RAW (no fusion). sglang-style router preprocessing
+        # (parameter-free RMSNorm + scale*root) is applied at runtime in
+        # Gemma4TopKRouter.gating. The old _fuse_router_weight divided by w2 in bf16
+        # (w2 has near-zero channels) which corrupted router logits → catastrophic
+        # gating divergence on common tokens.
 
         return super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
 
@@ -344,11 +321,17 @@ class Gemma4VLBridge(MegatronModelBridge):
             "language_model.decoder.layers.*.post_ffn_layernorm.weight": (
                 "model.language_model.layers.*.post_feedforward_layernorm.weight"
             ),
-            # === Pre-MLP layernorm (MoE pre-norm for routed experts) ===
-            "language_model.decoder.layers.*.pre_mlp_layernorm.weight": (
+            # === Dual pre-MLP layernorm ===
+            # Gemma 4 has separate pre-norms for the dense/shared-expert and MoE paths.
+            # Gemma4TransformerLayer sets the inherited pre_mlp_layernorm to Identity;
+            # Gemma4MoELayer applies pre_shared_layernorm (w_pffl_1) and
+            # pre_moe_layernorm (w_pffl_2) internally on the un-normed input.
+            "language_model.decoder.layers.*.mlp.pre_shared_layernorm.weight": (
+                "model.language_model.layers.*.pre_feedforward_layernorm.weight"
+            ),
+            "language_model.decoder.layers.*.mlp.pre_moe_layernorm.weight": (
                 "model.language_model.layers.*.pre_feedforward_layernorm_2.weight"
             ),
-            # (arch v5) shared_experts.linear_fc1 no longer carries a fused layer_norm_weight; w_pffl_1 is loaded into Gemma4TransformerLayer.pffl_weight buffer (see end of mapping table).
             # Dense MLP → Shared Expert fc2
             "language_model.decoder.layers.*.mlp.shared_experts.linear_fc2.weight": (
                 "model.language_model.layers.*.mlp.down_proj.weight"
@@ -400,11 +383,6 @@ class Gemma4VLBridge(MegatronModelBridge):
                 ReplicatedMapping(
                     megatron_param="language_model.decoder.layers.*.mlp.router.scale",
                     hf_param="model.language_model.layers.*.router.scale",
-                ),
-                # === Dense/shared-expert pre-norm (fused into gate/up on import; stored as buffer) ===
-                ReplicatedMapping(
-                    megatron_param="language_model.decoder.layers.*.pffl_weight",
-                    hf_param="model.language_model.layers.*.pre_feedforward_layernorm.weight",
                 ),
                 # === Post-MoE layernorm ===
                 ReplicatedMapping(

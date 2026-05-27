@@ -39,7 +39,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import MoECudaGraphPartialCaptureSignal
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from torch import Tensor
@@ -61,6 +63,7 @@ if TYPE_CHECKING:
 HAVE_TE = safe_import_from("megatron.core.extensions.transformer_engine", "TENorm")[1]
 TENorm, _ = safe_import_from("megatron.core.extensions.transformer_engine", "TENorm")
 TEDotProductAttention, _ = safe_import_from("megatron.core.extensions.transformer_engine", "TEDotProductAttention")
+te_checkpoint, _ = safe_import_from("megatron.core.extensions.transformer_engine", "te_checkpoint")
 
 
 @dataclass
@@ -201,9 +204,14 @@ class Gemma4TransformerLayer(TransformerLayer):
     def __init__(self, config, submodules, layer_number=1, **kwargs):
         super().__init__(config=config, submodules=submodules, layer_number=layer_number, **kwargs)
         self.register_buffer("layer_scalar", torch.ones(1, dtype=config.params_dtype))
-        # HF pre_feedforward_layernorm (dense/shared-expert pre-norm) has no MCore
-        # counterpart — stored as an inert buffer so it round-trips through export.
-        self.register_buffer("pffl_weight", torch.ones(config.hidden_size, dtype=config.params_dtype))
+
+        # HF Gemma-4 has dual pre-norm (pre_feedforward_layernorm for the dense/shared
+        # path, pre_feedforward_layernorm_2 for the MoE path). MCore's single
+        # pre_mlp_layernorm cannot represent both, and a per-channel ratio fusion into
+        # shared-expert weights destroys bf16 precision (ratio up to 24000x with sign
+        # flips). Make the inherited pre_mlp_layernorm a no-op and let Gemma4MoELayer
+        # apply both norms internally on the un-normed input.
+        self.pre_mlp_layernorm = torch.nn.Identity()
 
         # Post-feedforward layernorm: applied to combined dense+MoE output before residual add
         # (HF: post_feedforward_layernorm)
@@ -276,18 +284,57 @@ class Gemma4TopKRouter(TopKRouter):
             routing_probs = routing_probs * self.per_expert_scale.unsqueeze(0)
         return routing_probs, routing_map
 
+    def gating(self, input):
+        """sglang-faithful router input preprocessing.
+
+        sglang Gemma4Router: x = RMSNorm_noweight(x); x = x * (scale * hidden^-0.5); proj(x).
+        We do the parameter-free RMSNorm + per-channel scale + root_size here on the
+        UN-NORMED residual, then apply the RAW proj weight (no w2 fusion). This avoids
+        the bf16 division-by-w2 in the old _fuse_router_weight (w2 has ~5% near-zero
+        channels → catastrophic router-logit error on tokens activating them).
+        """
+        x = input.float()
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.config.layernorm_epsilon)
+        root_size = self.config.hidden_size ** -0.5
+        x = x * (self.scale.float() * root_size)
+        return super().gating(x.type_as(input))
+
 
 class Gemma4MoELayer(MoELayer):
-    """Gemma 4 MoE layer with post-routed-expert and post-shared-expert normalization.
+    """Gemma 4 MoE layer with dual pre-norm and dual post-norm matching HF.
 
-    Applies ``post_feedforward_layernorm_2`` (pffl_ln2) to routed expert output and
-    ``post_feedforward_layernorm_1`` (pffl_ln1) to shared expert output before combining.
-    Standard MCore MoELayer simply sums routed + shared outputs without any intermediate norms.
+    HF Gemma-4 has independent layernorms for the dense (shared-expert) path
+    and the routed-expert path::
+
+        pre_feedforward_layernorm    (w_pffl_1)  → shared expert input
+        pre_feedforward_layernorm_2  (w_pffl_2)  → router + routed expert input
+        post_feedforward_layernorm_1             → shared expert output
+        post_feedforward_layernorm_2             → routed expert output
+
+    Standard MCore MoELayer has a single pre-norm (handled by the parent
+    TransformerLayer) shared between both paths. Gemma4TransformerLayer makes
+    that pre_mlp_layernorm a no-op; this class applies both pre-norms here on
+    the un-normed input.  This avoids the bf16 precision loss of fusing the
+    (w_pffl_1 / w_pffl_2) ratio into shared-expert weights at load time
+    (per-channel ratio up to 24000x, with sign flips where w_pffl_2 ≈ 0).
     """
 
     def __init__(self, config, submodules, **kwargs):
         super().__init__(config=config, submodules=submodules, **kwargs)
         NormImpl = TENorm if HAVE_TE else torch.nn.Identity
+        # HF: pre_feedforward_layernorm — applied to shared-expert input
+        self.pre_shared_layernorm = NormImpl(
+            config=config,
+            hidden_size=config.hidden_size,
+            eps=config.layernorm_epsilon,
+        )
+        # HF: pre_feedforward_layernorm_2 — applied to router + routed-expert input
+        self.pre_moe_layernorm = NormImpl(
+            config=config,
+            hidden_size=config.hidden_size,
+            eps=config.layernorm_epsilon,
+        )
         # HF: post_feedforward_layernorm_2 — applied to routed expert output
         self.post_moe_layernorm = NormImpl(
             config=config,
@@ -300,15 +347,88 @@ class Gemma4MoELayer(MoELayer):
             hidden_size=config.hidden_size,
             eps=config.layernorm_epsilon,
         )
-        # MILES production fix: the previous bridge approach fused the
-        # (w_pffl_1 / w_pffl_2) ratio into shared expert weights at load time;
-        # in bf16 this destroyed precision wherever w_pffl_2 was near zero
-        # (ratio up to 24000x).  The load-time fusion is now disabled in
-        # gemma4_vl_bridge.maybe_modify_loaded_hf_weight, raw HF gate/up are
-        # loaded directly, and shared_experts_compute uses the standard MoELayer
-        # path.  Mathematically the shared expert receives pre_ff_norm_2(x)
-        # instead of pre_ff_norm_1(x), which empirically tracks sglang within
-        # ~0.036 mean lpdiff — better than any runtime correction we tried.
+
+    @staticmethod
+    def _unwrap(out):
+        return out[0] if isinstance(out, tuple) else out
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        intermediate_tensors=None,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
+        """MoE forward with HF dual pre-norm.
+
+        Replicates the parent MoELayer.forward but applies pre_shared_layernorm
+        to the shared-expert path and pre_moe_layernorm to the router /
+        routed-expert path, using the same un-normed input.
+        """
+        if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
+            raise ValueError(
+                "During training, performance may degrade if MoE and tensor parallelism"
+                " are enabled without also enabling sequence parallelism."
+            )
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
+
+        def custom_forward(hidden_states, intermediate_tensors, padding_mask=None):
+            shared_normed = self._unwrap(self.pre_shared_layernorm(hidden_states))
+            routed_normed = self._unwrap(self.pre_moe_layernorm(hidden_states))
+
+            shared_expert_output = None
+            output, mlp_bias = None, None
+            try:
+                if "route" in self.fwd_execution_map:
+                    shared_expert_output = self.shared_experts_compute(shared_normed)
+                    # Router gets the UN-NORMED residual; Gemma4TopKRouter.gating applies
+                    # parameter-free RMSNorm + scale*root (sglang design). Routed experts
+                    # still consume the w2-normed routed_normed.
+                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    routed_normed, probs = self.preprocess(routed_normed, probs, routing_map)
+                    if intermediate_tensors is not None:
+                        return routed_normed, probs, shared_expert_output
+            except MoECudaGraphPartialCaptureSignal as e:
+                return e.get_early_return_outputs(routed_normed, shared_expert_output)
+
+            if "expert_compute" in self.fwd_execution_map:
+                if intermediate_tensors is not None:
+                    routed_normed, probs = intermediate_tensors
+                dispatched_input, probs = self.dispatch(routed_normed, probs)
+                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                assert (
+                    mlp_bias is None
+                ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                output = self.combine(output)
+                if intermediate_tensors is not None:
+                    return output, mlp_bias
+
+            if "postprocess" in self.fwd_execution_map:
+                if intermediate_tensors is not None:
+                    output, shared_expert_output = intermediate_tensors
+                output = self.postprocess(output, shared_expert_output)
+                if intermediate_tensors is not None:
+                    return output
+
+            return output, mlp_bias
+
+        if self.moe_layer_recompute:
+            if self.config.fp8 or self.config.fp4:
+                outputs = te_checkpoint(
+                    custom_forward,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    hidden_states,
+                    padding_mask,
+                )
+            else:
+                outputs = tensor_parallel.checkpoint(
+                    custom_forward, False, hidden_states, padding_mask
+                )
+        else:
+            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+        return outputs
 
     def postprocess(self, output, shared_expert_output):
         """Apply post-MoE norms to routed and shared expert outputs, then combine."""
