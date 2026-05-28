@@ -103,6 +103,10 @@ class Gemma4ModelProvider(GPTModelProvider):
     num_global_key_value_heads: int = 2
     global_rotary_percent: float = 0.25
 
+    # K=V weight tying for global attention layers (v_proj absent in HF checkpoint).
+    # Set from HF config.attention_k_eq_v; controls _install_tied_kv (MoE and dense).
+    attention_k_eq_v: bool = False
+
     # MLP / Activation
     gated_linear_unit: bool = True
     add_bias_linear: bool = False
@@ -482,17 +486,17 @@ def _install_tied_kv(model: "torch.nn.Module", provider: "Gemma4ModelProvider") 
     :meth:`Gemma4SelfAttention.get_query_key_value_tensors` can enforce V=K in
     the forward pass.
 
-    Skips dense models (``provider.num_moe_experts is None``) where K=V sharing
-    has not been verified.  Must be called after model construction so that the
-    attention modules are already built.
+    K=V sharing is decided by the ``provider.attention_k_eq_v`` field (set from
+    the HF config), covering both MoE and dense variants.  Must be called after
+    model construction so that the attention modules are already built.
 
     Note on gradient routing for LoRA: since V-rows = K-rows in the loaded
     checkpoint, the forward pass is numerically correct without any further
     modification.  Full gradient routing (accumulating dL/dV into K-rows) is
     left as a future improvement.
     """
-    # Only confirmed for MoE models (26B-A4B family); skip dense variants
-    if getattr(provider, "num_moe_experts", None) is None:
+    # K=V tying decided by attention_k_eq_v (HF config); covers MoE and dense.
+    if not getattr(provider, "attention_k_eq_v", False):
         return
 
     num_global_kv_heads = getattr(provider, "num_global_key_value_heads", None)
