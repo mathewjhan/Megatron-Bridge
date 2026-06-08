@@ -386,12 +386,12 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
             "language_model.mtp.layers.0.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
             "language_model.mtp.layers.0.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
             "language_model.mtp.layers.0.final_layernorm.weight": "mtp.norm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.mlp.router.weight": "mtp.layers.0.mlp.gate.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.pre_mlp_layernorm.weight": "mtp.layers.0.post_attention_layernorm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.layer_norm_weight": "mtp.layers.0.input_layernorm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.self_attention.q_layernorm.weight": "mtp.layers.0.self_attn.q_norm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.self_attention.k_layernorm.weight": "mtp.layers.0.self_attn.k_norm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.self_attention.linear_proj.weight": "mtp.layers.0.self_attn.o_proj.weight",
+            "language_model.mtp.layers.0.transformer_layer.mlp.router.weight": "mtp.layers.0.mlp.gate.weight",
+            "language_model.mtp.layers.0.transformer_layer.pre_mlp_layernorm.weight": "mtp.layers.0.post_attention_layernorm.weight",
+            "language_model.mtp.layers.0.transformer_layer.self_attention.linear_qkv.layer_norm_weight": "mtp.layers.0.input_layernorm.weight",
+            "language_model.mtp.layers.0.transformer_layer.self_attention.q_layernorm.weight": "mtp.layers.0.self_attn.q_norm.weight",
+            "language_model.mtp.layers.0.transformer_layer.self_attention.k_layernorm.weight": "mtp.layers.0.self_attn.k_norm.weight",
+            "language_model.mtp.layers.0.transformer_layer.self_attention.linear_proj.weight": "mtp.layers.0.self_attn.o_proj.weight",
         }
         for megatron_param, hf_param in mtp_param_mappings.items():
             mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
@@ -399,31 +399,31 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
         mapping_list.extend(
             [
                 QKVMapping(
-                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.self_attention.linear_qkv.weight",
+                    megatron_param="language_model.mtp.layers.*.transformer_layer.self_attention.linear_qkv.weight",
                     q="mtp.layers.*.self_attn.q_proj.weight",
                     k="mtp.layers.*.self_attn.k_proj.weight",
                     v="mtp.layers.*.self_attn.v_proj.weight",
                 ),
                 GatedMLPMapping(
-                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.linear_fc1.weight*",
+                    megatron_param="language_model.mtp.layers.*.transformer_layer.mlp.experts.linear_fc1.weight*",
                     gate="mtp.layers.*.mlp.experts.*.gate_proj.weight",
                     up="mtp.layers.*.mlp.experts.*.up_proj.weight",
                 ),
                 AutoMapping(
-                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.linear_fc2.weight*",
+                    megatron_param="language_model.mtp.layers.*.transformer_layer.mlp.experts.linear_fc2.weight*",
                     hf_param="mtp.layers.*.mlp.experts.*.down_proj.weight",
                 ),
                 GatedMLPMapping(
-                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.shared_experts.linear_fc1.weight",
+                    megatron_param="language_model.mtp.layers.*.transformer_layer.mlp.shared_experts.linear_fc1.weight",
                     gate="mtp.layers.*.mlp.shared_expert.gate_proj.weight",
                     up="mtp.layers.*.mlp.shared_expert.up_proj.weight",
                 ),
                 AutoMapping(
-                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.shared_experts.linear_fc2.weight",
+                    megatron_param="language_model.mtp.layers.*.transformer_layer.mlp.shared_experts.linear_fc2.weight",
                     hf_param="mtp.layers.*.mlp.shared_expert.down_proj.weight",
                 ),
                 ReplicatedMapping(
-                    megatron_param="language_model.mtp.layers.0.mtp_model_layer.mlp.shared_experts.gate_weight",
+                    megatron_param="language_model.mtp.layers.0.transformer_layer.mlp.shared_experts.gate_weight",
                     hf_param="mtp.layers.0.mlp.shared_expert_gate.weight",
                 ),
             ]
@@ -663,12 +663,12 @@ class Qwen35VLBridge(MegatronModelBridge):
             "language_model.mtp.layers.0.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
             "language_model.mtp.layers.0.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
             "language_model.mtp.layers.0.final_layernorm.weight": "mtp.norm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.mlp.linear_fc1.layer_norm_weight": "mtp.layers.0.post_attention_layernorm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.mlp.linear_fc2.weight": "mtp.layers.0.mlp.down_proj.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.layer_norm_weight": "mtp.layers.0.input_layernorm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.self_attention.q_layernorm.weight": "mtp.layers.0.self_attn.q_norm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.self_attention.k_layernorm.weight": "mtp.layers.0.self_attn.k_norm.weight",
-            "language_model.mtp.layers.0.mtp_model_layer.self_attention.linear_proj.weight": "mtp.layers.0.self_attn.o_proj.weight",
+            "language_model.mtp.layers.0.transformer_layer.mlp.linear_fc1.layer_norm_weight": "mtp.layers.0.post_attention_layernorm.weight",
+            "language_model.mtp.layers.0.transformer_layer.mlp.linear_fc2.weight": "mtp.layers.0.mlp.down_proj.weight",
+            "language_model.mtp.layers.0.transformer_layer.self_attention.linear_qkv.layer_norm_weight": "mtp.layers.0.input_layernorm.weight",
+            "language_model.mtp.layers.0.transformer_layer.self_attention.q_layernorm.weight": "mtp.layers.0.self_attn.q_norm.weight",
+            "language_model.mtp.layers.0.transformer_layer.self_attention.k_layernorm.weight": "mtp.layers.0.self_attn.k_norm.weight",
+            "language_model.mtp.layers.0.transformer_layer.self_attention.linear_proj.weight": "mtp.layers.0.self_attn.o_proj.weight",
         }
         for megatron_param, hf_param in mtp_param_mappings.items():
             mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
@@ -676,13 +676,13 @@ class Qwen35VLBridge(MegatronModelBridge):
         mapping_list.extend(
             [
                 QKVMapping(
-                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.self_attention.linear_qkv.weight",
+                    megatron_param="language_model.mtp.layers.*.transformer_layer.self_attention.linear_qkv.weight",
                     q="mtp.layers.*.self_attn.q_proj.weight",
                     k="mtp.layers.*.self_attn.k_proj.weight",
                     v="mtp.layers.*.self_attn.v_proj.weight",
                 ),
                 GatedMLPMapping(
-                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.linear_fc1.weight",
+                    megatron_param="language_model.mtp.layers.*.transformer_layer.mlp.linear_fc1.weight",
                     gate="mtp.layers.*.mlp.gate_proj.weight",
                     up="mtp.layers.*.mlp.up_proj.weight",
                 ),
