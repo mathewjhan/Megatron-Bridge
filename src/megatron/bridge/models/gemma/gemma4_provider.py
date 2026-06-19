@@ -222,7 +222,7 @@ class Gemma4TransformerLayer(TransformerLayer):
             eps=config.layernorm_epsilon,
         )
 
-    def _forward_post_mlp(self, mlp_output_with_bias, residual):
+    def _forward_post_mlp(self, mlp_output_with_bias, residual, *, hc_ffn_post=None, hc_ffn_comb=None):  # compat: newer Megatron-LM passes DSV4-mode HC kwargs (None for Gemma-4)
         """Override to apply post_ffn_layernorm before residual add, then layer_scalar."""
         from megatron.core.utils import make_viewless_tensor
 
@@ -268,9 +268,9 @@ class Gemma4TopKRouter(TopKRouter):
             torch.ones(config.hidden_size, dtype=config.params_dtype),
         )
 
-    def routing(self, logits, padding_mask=None):
+    def routing(self, logits, padding_mask=None, input_ids=None):  # compat: newer Megatron-LM threads input_ids through the router
         """Apply standard routing, then renormalize and scale by per_expert_scale."""
-        routing_probs, routing_map = super().routing(logits, padding_mask=padding_mask)
+        routing_probs, routing_map = super().routing(logits, padding_mask=padding_mask, input_ids=input_ids)
         # routing_probs: [num_tokens, num_experts] sparse — non-zero at selected experts
         # routing_map: [num_tokens, num_experts] boolean mask
         #
@@ -357,6 +357,7 @@ class Gemma4MoELayer(MoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
+        input_ids=None,  # compat: newer Megatron-LM threads input_ids to MoE layers; unused (hidden_size_per_layer_input=0)
     ):
         """MoE forward with HF dual pre-norm.
 
