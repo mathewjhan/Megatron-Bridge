@@ -452,10 +452,8 @@ class Gemma4MoELayer(MoELayer):
 def _logit_softcapping(logits: torch.Tensor, scale: float | None) -> torch.Tensor:
     """Apply HF final_logit_softcapping: scale * tanh(logits / scale).
 
-    The true HF Gemma-4 model AND sglang's LogitsProcessor both apply this
-    (config.final_logit_softcapping=30.0). A prior MILES patch skipped it on a
-    wrong premise; that made the bridge's logits over-extreme on tail tokens vs
-    sglang/HF and inflated train_rollout_logprob_abs_diff.
+    HF Gemma-4 and sglang's LogitsProcessor both apply this
+    (config.final_logit_softcapping=30.0), so the bridge must match.
     """
     if scale is None:
         return logits
@@ -681,15 +679,8 @@ class Gemma4SelfAttention(SelfAttention):
         if len(result) < 3:
             return result
         query, key, value = result[0], result[1], result[2]
-        # For global attention layers K=V tying is required (HF Gemma4 has no v_proj).
-        # MILES FIX: do NOT overwrite value with K-normalized — that double-norms.
-        # The V projection weights = K weights (copied at import). super() returns
-        # V tensor after projection (V_raw = K_raw numerically). Then v_norm below
-        # applies single normalization — matching sglang's behavior:
-        #   q = q_norm(Q_raw); k = k_norm(K_raw); v = v_norm(V_raw=K_raw)
-        # if getattr(self, "_tied_kv", False):
-        #     value = key
-        # MILES V-RMSNorm v8: restored after diagnostic (v7 skip → lpdiff 0.45 → 1.60).
+        # Global attention has no v_proj (K=V tying): V weights = K weights at import,
+        # so apply a single param-free RMSNorm to V (matches sglang: v = v_norm(V_raw)).
         v_float = value.float()
         rsigma = torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + self._v_norm_eps)
         value = (v_float * rsigma).to(value.dtype)
