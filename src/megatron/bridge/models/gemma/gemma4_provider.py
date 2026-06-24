@@ -103,8 +103,7 @@ class Gemma4ModelProvider(GPTModelProvider):
     num_global_key_value_heads: int = 2
     global_rotary_percent: float = 0.25
 
-    # K=V weight tying for global attention layers (v_proj absent in HF checkpoint).
-    # Set from HF config.attention_k_eq_v; controls _install_tied_kv (MoE and dense).
+    # K=V tying for global-attn layers (v_proj absent in HF ckpt); from config.attention_k_eq_v
     attention_k_eq_v: bool = False
 
     # MLP / Activation
@@ -495,7 +494,6 @@ def _install_tied_kv(model: "torch.nn.Module", provider: "Gemma4ModelProvider") 
     modification.  Full gradient routing (accumulating dL/dV into K-rows) is
     left as a future improvement.
     """
-    # K=V tying decided by attention_k_eq_v (HF config); covers MoE and dense.
     if not getattr(provider, "attention_k_eq_v", False):
         return
 

@@ -75,9 +75,7 @@ class Gemma4VLBridge(MegatronModelBridge):
         text_config = hf_config.text_config
         vision_config = hf_config.vision_config
 
-        # Supports MoE (enable_moe_block=True) and dense models without per-layer
-        # hidden sizes (hidden_size_per_layer_input == 0, e.g. the 31B variant).
-        # Dense models WITH per-layer embeddings (PLE) are not yet supported in MCore.
+        # accept MoE, or dense without per-layer hidden sizes (PLE unsupported in MCore)
         if not getattr(text_config, "enable_moe_block", False) and getattr(
             text_config, "hidden_size_per_layer_input", 0
         ):
@@ -336,10 +334,7 @@ class Gemma4VLBridge(MegatronModelBridge):
             "language_model.decoder.layers.*.post_ffn_layernorm.weight": (
                 "model.language_model.layers.*.post_feedforward_layernorm.weight"
             ),
-            # === Dense MLP (non-MoE variants, e.g. 31B) ===
-            # Plain gated MLP. pre_feedforward_layernorm is fused into linear_fc1
-            # (our linear_proj already carries post_attention_layernorm). These
-            # keys are absent on MoE checkpoints, so the mappings stay inert there.
+            # === Dense MLP (non-MoE, e.g. 31B); fc1 carries pre_feedforward_layernorm, inert on MoE ===
             "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": (
                 "model.language_model.layers.*.pre_feedforward_layernorm.weight"
             ),
