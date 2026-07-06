@@ -4,14 +4,13 @@
 
 """GLM-5 UNFUSED DSA backend (goes through megatron-core / megatron-bridge).
 
-The default (``dsa_attention_backend = "megatron"``) and currently only
-DSA backend. The unfused sparse-MLA path reuses megatron-core's experimental
-``DSAttention`` (lightning indexer + ``unfused_dsa_fn``); GLM-5.2 cross-layer
-index-sharing is layered on top by ``CrossLayerDSAttention`` in
-``../cross_layer_dsa_dispatch.py``.
+Selected when ``dsa_attention_backend != "tilelang"`` (the default). The unfused
+sparse-MLA path reuses megatron-core's experimental ``DSAttention`` (lightning
+indexer + ``unfused_dsa_fn``); GLM-5.2 cross-layer index-sharing is layered on
+top by ``CrossLayerDSAttention`` in ``../cross_layer_dsa_dispatch.py``.
 
 Centralising the megatron-core DSA imports here marks the unfused backend's
-single entry point.
+single entry point (mirrors how ``../tilelang/`` is the tilelang entry point).
 """
 
 from megatron.core.transformer.experimental_attention_variant.dsa import (
