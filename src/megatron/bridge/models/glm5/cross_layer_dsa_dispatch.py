@@ -154,18 +154,27 @@ class CrossLayerDSAttention(DSAttention):
         attention_bias=None,
         packed_seq_params=None,
     ):
-        # GLM-5.1 / no cross-layer sharing: byte-for-byte the base class.
+        backend = getattr(self.config, "dsa_attention_backend", "megatron")
+
+        # GLM-5.1 / no cross-layer sharing. With the default (unfused) backend this stays byte-for-
+        # byte the base class. With the ``tilelang`` backend we run the single-layer logic in-class so
+        # the sparse-attention kernel is dispatchable -- the base ``DSAttention.forward`` calls the
+        # unfused kernel directly and lives in megatron-core, so it cannot be intercepted there.
         if not self._index_share:
-            return super().forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                x,
-                qr,
-                attn_mask_type,
-                attention_bias,
-                packed_seq_params,
+            if backend != "tilelang":
+                return super().forward(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    x,
+                    qr,
+                    attn_mask_type,
+                    attention_bias,
+                    packed_seq_params,
+                )
+            return self._compute_layer_forward(
+                query, key, value, attention_mask, x, qr, attn_mask_type, packed_seq_params, holder=None
             )
 
         # bshd (``packed_seq_params is None``) uses the thread-local holder fallback, which is
@@ -203,11 +212,16 @@ class CrossLayerDSAttention(DSAttention):
         )
 
     def _sparse_attention(self, query, key, value, topk_indices):
-        """Sparse-MLA attention kernel call.
+        """Dispatch the sparse-MLA attention kernel to the configured backend.
 
-        Centralising the call here keeps the GLM-5.1 and GLM-5.2 forwards on a single,
-        backend-agnostic dispatch point.
+        Both branches currently call the unfused megatron-core kernel; the ``tilelang`` fused TileLang
+        ``SparseMLA`` path is wired in a later step. Centralising the call here keeps the GLM-5.1 and
+        GLM-5.2 forwards on a single, backend-agnostic dispatch point.
         """
+        if getattr(self.config, "dsa_attention_backend", "megatron") == "tilelang":
+            # TODO(fused backend, Step 4): call the TileLang SparseMLA kernel here. Until it is
+            # wired the tilelang backend uses the unfused kernel so the plumbing is regression-safe.
+            return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
         return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
     def _compute_layer_forward(
@@ -294,6 +308,12 @@ def get_glm5_crosslayer_dsa_spec(config, backend=None):
         backend = _eav._get_backend_spec_provider(config=config)
     spec = _eav.get_dsa_module_spec_for_backend(config=config, backend=backend)
     spec.submodules.core_attention.module = CrossLayerDSAttention
+    # Point the MLA self-attention module at TileLangMLASelfAttention so the fused (tilelang) backend is
+    # dispatchable from the MLA level (where the absorbed-latent q/kv live). With the default
+    # "megatron" backend its forward delegates to MLASelfAttention.forward -> unchanged.
+    from megatron.bridge.models.glm5.tilelang.tilelang_mla import TileLangMLASelfAttention
+
+    spec.module = TileLangMLASelfAttention
     if spec.metainfo is None:
         spec.metainfo = {}
     spec.metainfo.setdefault("fuse_input_layernorm", False)

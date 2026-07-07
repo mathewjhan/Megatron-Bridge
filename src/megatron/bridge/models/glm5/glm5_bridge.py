@@ -183,6 +183,17 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
             if spec.metainfo is None:
                 spec.metainfo = {}
             spec.metainfo.setdefault("fuse_input_layernorm", False)
+        # GLM-5.1 (no cross-layer sharing): point the MLA self-attention at TileLangMLASelfAttention so
+        # the fused (tilelang) backend is dispatchable. Only meaningful when this is the DSA MLA spec.
+        # With the default "megatron" backend its forward delegates to the base class ->
+        # byte-identical. Guarded so we never re-wrap a non-DSA / non-MLA spec.
+        if (
+            getattr(config, "experimental_attention_variant", None) == "dsa"
+            and getattr(getattr(spec, "module", None), "__name__", "") == "MLASelfAttention"
+        ):
+            from megatron.bridge.models.glm5.tilelang.tilelang_mla import TileLangMLASelfAttention
+
+            spec.module = TileLangMLASelfAttention
         return spec
 
     _eav.get_experimental_attention_variant_module_spec = _patched
