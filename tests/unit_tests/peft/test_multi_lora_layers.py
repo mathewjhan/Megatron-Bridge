@@ -18,11 +18,13 @@ Mock-level (no distributed):
   * B7: grouped-GEMM path rejects adapter dropout > 0 (it cannot apply it)
   * B2: expose_adapter_slot / hide_adapters restore the ModuleList even if the body raises
   * B8: MoE expert linears are skipped with a one-time warning, not silently
-  * B9: load_adapter raises on a partial checkpoint instead of leaving slots at random init
+  * B9: load_adapter raises on a checkpoint/model mismatch in either direction
+    (params missing from the checkpoint, or checkpoint tensors no param consumed)
 
 Single-GPU integration (needs CUDA + model-parallel init):
-  * B3: alpha/rank scaling is stored in fp32 and applied through a forward
-  * B4: reset_adapter re-inits through the model-parallel RNG tracker (deterministic)
+  * grouped-GEMM forward smoke: output shape / finiteness / dtype (no fp32 promotion)
+  * B4: reset_adapter re-inits through the model-parallel RNG tracker —
+    deterministic given tracker state, mirroring the construction-time init methods
 """
 
 import os
@@ -33,7 +35,6 @@ import torch
 import torch.nn as nn
 
 from megatron.bridge.peft import multi_lora as multi_lora_mod
-from megatron.bridge.peft import multi_lora_layers as mll
 from megatron.bridge.peft.multi_lora import MultiLoRA
 from megatron.bridge.peft.multi_lora_layers import (
     MultiLoRALinear,
@@ -123,7 +124,7 @@ def test_expert_skip_warns_once():
 
 
 # --------------------------------------------------------------------------- #
-# B9: load_adapter raises on a partial checkpoint (missing adapter params).
+# B9: load_adapter raises on a checkpoint/model mismatch in either direction.
 # --------------------------------------------------------------------------- #
 class _AdapterModel(nn.Module):
     def __init__(self):
@@ -151,8 +152,21 @@ def test_load_adapter_full_ok():
     assert torch.allclose(m.layer.adapter.linear_in.weight, torch.ones(8, 4))
 
 
+def test_load_adapter_unused_keys_raises():
+    m = _AdapterModel()
+    over_full = {
+        "layer.adapter.linear_in.weight": torch.ones(8, 4),
+        "layer.adapter.linear_out.weight": torch.ones(4, 8),
+        # e.g. saved with a larger target_modules set than the resuming model
+        "other_layer.adapter.linear_in.weight": torch.ones(8, 4),
+    }
+    with pytest.raises(KeyError, match="matched no"):
+        load_adapter(m, 0, over_full)
+
+
 # --------------------------------------------------------------------------- #
-# B3 / B4: single-GPU integration through a real ColumnParallelLinear.
+# Forward smoke / B4 reset: single-GPU integration through a real
+# ColumnParallelLinear.
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU + model-parallel init")
 class TestMultiLoRALinearGPU:
@@ -170,9 +184,7 @@ class TestMultiLoRALinearGPU:
             torch.cuda.set_device(0)
             dist.init_process_group(backend="nccl", world_size=1, rank=0)
         if not parallel_state.model_parallel_is_initialized():
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-            )
+            parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
         from megatron.core.process_groups_config import ProcessGroupCollection
 
         from megatron.bridge.training.initialize import _set_random_seed
@@ -193,7 +205,7 @@ class TestMultiLoRALinearGPU:
         except Exception:
             pass
 
-    def _build(self, dim=8, n_adapters=2, alpha=16):
+    def _build(self, dim=8, n_adapters=2, alpha=16, column_init_method="xavier"):
         from megatron.core.tensor_parallel import ColumnParallelLinear
         from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -222,38 +234,30 @@ class TestMultiLoRALinearGPU:
             dim=dim,
             alpha=alpha,
             full_name="linear_qkv",
-            column_init_method="xavier",
+            column_init_method=column_init_method,
             row_init_method="zero",
             dropout=0.0,
         )
         # Mirror model setup: adapter weights are cast to the compute dtype
-        # (the base is bf16). alpha_values/rank_values are plain tensor
-        # attributes (not params/buffers), so this cast leaves them fp32 — which
-        # is the whole point of the B3 fix.
+        # (the base is bf16).
         mlora.adapters.to(device="cuda", dtype=torch.bfloat16)
         return mlora
 
-    def test_scaling_stored_in_fp32(self):
-        mlora = self._build()
-        assert mlora.alpha_values.dtype == torch.float32
-        assert mlora.rank_values.dtype == torch.float32
-
-    def test_forward_runs_with_fp32_scaling(self):
+    def test_forward_grouped_gemm_smoke(self):
         from megatron.bridge.peft.multi_lora_layers import (
             init_adapter_slot,
             set_tokens_per_adapter_slot,
         )
 
         mlora = self._build(dim=8, n_adapters=2, alpha=12)
-        # non-power-of-two alpha/rank ratio (12/6) is exactly where bf16 would bias
         init_adapter_slot([mlora], 0, rank=6, alpha=12)
         tokens = 4
-        set_tokens_per_adapter_slot(
-            [mlora], torch.tensor([tokens, 0], dtype=torch.int32, device="cuda")
-        )
+        set_tokens_per_adapter_slot([mlora], torch.tensor([tokens, 0], dtype=torch.int32, device="cuda"))
         x = torch.randn(tokens, 16, dtype=torch.bfloat16, device="cuda")
         out, _ = mlora(x)
         assert out.shape[0] == tokens
+        # scaling must not promote the activation dtype (bf16 * fp32 -> fp32)
+        assert out.dtype == torch.bfloat16
         assert torch.isfinite(out.float()).all()
 
     def test_reset_adapter_through_rng_tracker(self):
@@ -268,6 +272,48 @@ class TestMultiLoRALinearGPU:
         b = mlora.adapters[idx].linear_out.weight
         assert not torch.allclose(a, torch.full_like(a, 7.0))  # A re-initialized (xavier)
         assert torch.count_nonzero(b) == 0  # B zero-initialized
+
+    def test_reset_adapter_deterministic_via_rng_tracker(self):
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        from megatron.bridge.training.initialize import _set_random_seed
+
+        def reseed():
+            _set_random_seed(
+                seed_=1234,
+                data_parallel_random_init=False,
+                te_rng_tracker=True,
+                inference_rng_tracker=False,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+
+        mlora = self._build()
+        idx = 0
+
+        reseed()
+        torch.cuda.manual_seed(111)  # a bare nn.init would draw from here...
+        mlora.clear_adapter_slot(idx)
+        first = mlora.adapters[idx].linear_in.weight.clone()
+
+        reseed()
+        torch.cuda.manual_seed(222)  # ...and this seed change would alter its result
+        mlora.clear_adapter_slot(idx)
+        second = mlora.adapters[idx].linear_in.weight
+
+        # An identically re-seeded tracker must give an identical re-init
+        # regardless of the default generator — the draw has to come from the
+        # tracker stream (this is what keeps DP replicas equal on slot reuse).
+        assert torch.equal(first, second)
+
+    def test_reset_adapter_mirrors_construction_init_methods(self):
+        mlora = self._build(column_init_method="zero")
+        idx = 0
+        with torch.no_grad():
+            mlora.adapters[idx].linear_in.weight.fill_(7.0)
+        mlora.clear_adapter_slot(idx)
+        # Construction used column_init_method="zero"; reset must reuse it (a
+        # hardcoded xavier re-init would leave nonzero values here).
+        assert torch.count_nonzero(mlora.adapters[idx].linear_in.weight) == 0
 
 
 if __name__ == "__main__":
