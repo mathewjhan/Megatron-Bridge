@@ -66,10 +66,21 @@ class MultiLoRALinear(AdapterWrapper):
         a2a_experimental: bool = False,
     ) -> None:
         nn.Module.__init__(self)
+        # The grouped-GEMM forward below never runs each adapter's own
+        # ParallelLinearAdapter.forward, so adapter dropout would be silently
+        # dropped. Reject dropout>0 loudly instead of pretending to apply it.
+        assert dropout == 0.0, (
+            f"MultiLoRALinear grouped-GEMM path does not apply adapter dropout "
+            f"(got dropout={dropout}); set dropout/--lora-dropout to 0."
+        )
         self.to_wrap = to_wrap
         self._adapter_enabled = True
         self.n_adapters = n_adapters
         self.max_rank = dim
+        # Kept so a slot re-init (reset_adapter) mirrors the construction-time
+        # init methods instead of hardcoding xavier/zero.
+        self._column_init_method = column_init_method
+        self._row_init_method = row_init_method
 
         attrs = get_adapter_attributes_from_linear(to_wrap)
 
@@ -106,9 +117,12 @@ class MultiLoRALinear(AdapterWrapper):
 
         self.tokens_per_adapter: Optional[torch.Tensor] = None
         device = next(to_wrap.parameters()).device
-        dtype = next(to_wrap.parameters()).dtype
-        self.alpha_values = torch.ones(n_adapters, dtype=dtype, device=device)
-        self.rank_values = torch.full((n_adapters,), dim, dtype=dtype, device=device)
+        # alpha/rank scaling is kept in fp32: a non-power-of-two alpha/rank ratio
+        # rounded in bf16 biases every LoRA delta (up to ~0.2%), a systematic
+        # train/rollout parity confounder. Cast to the activation dtype only at
+        # the final multiply in forward().
+        self.alpha_values = torch.ones(n_adapters, dtype=torch.float32, device=device)
+        self.rank_values = torch.full((n_adapters,), dim, dtype=torch.float32, device=device)
 
     def forward(
         self, x: torch.Tensor, *args: Any, **kwargs: Any
@@ -150,7 +164,7 @@ class MultiLoRALinear(AdapterWrapper):
         # (``tokens_per_adapter`` sums to it); doing it after a sequence-parallel
         # scatter would leave ``out`` with ``tokens/tp`` rows and crash here.
         scaling = self.alpha_values / self.rank_values
-        per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
+        per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1).to(out.dtype)
         out = out * per_token_scaling
 
         # Match the wrapped base linear's output layout: row-parallel base
@@ -168,11 +182,20 @@ class MultiLoRALinear(AdapterWrapper):
         return linear_output + out.reshape(linear_output.shape), bias
 
     def reset_adapter(self, idx: int) -> None:
+        # Re-init through the model-parallel RNG tracker so every DP replica
+        # produces identical weights regardless of how far the global RNG has
+        # advanced since model build. A bare nn.init here diverges replicas on
+        # slot reuse (breaking the DP-equal invariant the weight checker relies
+        # on). Mirror the construction-time init methods rather than hardcoding.
+        from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
         from megatron.bridge.peft.utils import ParallelLinearAdapter
-        col_fn = ParallelLinearAdapter._get_init_fn(None, "xavier")
-        row_fn = ParallelLinearAdapter._get_init_fn(None, "zero")
-        col_fn(self.adapters[idx].linear_in.weight.data)
-        row_fn(self.adapters[idx].linear_out.weight.data)
+
+        adapter = self.adapters[idx]
+        col_fn = ParallelLinearAdapter._get_init_fn(None, self._column_init_method)
+        row_fn = ParallelLinearAdapter._get_init_fn(None, self._row_init_method)
+        with get_cuda_rng_tracker().fork():
+            col_fn(adapter.linear_in.weight.data)
+            row_fn(adapter.linear_out.weight.data)
 
     def init_adapter_slot(self, idx: int, rank: int, alpha: float) -> None:
         """Claim slot ``idx`` for an adapter: bind ``rank``/``alpha`` and apply the rank mask."""
@@ -304,6 +327,7 @@ def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> int:
     Returns the number of tensors loaded (for logging / sanity checks).
     """
     loaded = 0
+    missing = []
     with expose_adapter_slot(model, idx):
         models = model if isinstance(model, list) else [model]
         for chunk in models:
@@ -311,10 +335,20 @@ def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> int:
                 if ".adapter." not in name:
                     continue
                 if name not in state_dict:
+                    missing.append(name)
                     continue
                 src = state_dict[name].to(device=param.device, dtype=param.dtype)
                 param.data.copy_(src)
                 loaded += 1
+    # A partial load silently leaves the unmatched slots at random init (e.g.
+    # resuming after target_modules changed) — a zero-delta / wrong adapter with
+    # no error. Fail loud instead.
+    if missing:
+        raise KeyError(
+            f"load_adapter(slot={idx}): {len(missing)} adapter param(s) absent from the "
+            f"checkpoint (e.g. {missing[0]}); they would stay at random init. "
+            f"Loaded {loaded}. Did target_modules change since the checkpoint was saved?"
+        )
     return loaded
 
 
@@ -344,13 +378,18 @@ def expose_adapter_slot(model, idx: int):
                 saved[id(m)] = m._modules.pop("adapters")
                 m.adapter = saved[id(m)][idx]
 
-        yield
-
-        for m in modules:
-            if id(m) in saved:
-                if "adapter" in m._modules:
-                    del m._modules["adapter"]
-                m._modules["adapters"] = saved[id(m)]
+        # try/finally: an exception in the body (e.g. an export/save error, which
+        # happens on the weight-push path) must still restore the ModuleList,
+        # otherwise `adapters` stays detached and every later forward/save/
+        # named_parameters is silently corrupted.
+        try:
+            yield
+        finally:
+            for m in modules:
+                if id(m) in saved:
+                    if "adapter" in m._modules:
+                        del m._modules["adapter"]
+                    m._modules["adapters"] = saved[id(m)]
 
     return _ctx()
 
@@ -370,9 +409,13 @@ def hide_adapters(model):
         for m in modules:
             if isinstance(m, MultiLoRALinear) and "adapters" in m._modules:
                 saved[id(m)] = m._modules.pop("adapters")
-        yield
-        for m in modules:
-            if id(m) in saved:
-                m._modules["adapters"] = saved[id(m)]
+        # try/finally: restore even if base-checkpoint loading raises, else the
+        # adapters stay hidden from the model permanently.
+        try:
+            yield
+        finally:
+            for m in modules:
+                if id(m) in saved:
+                    m._modules["adapters"] = saved[id(m)]
 
     return _ctx()

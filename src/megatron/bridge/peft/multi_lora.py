@@ -34,6 +34,10 @@ from megatron.bridge.peft.utils import is_expert_linear
 
 logger = logging.getLogger(__name__)
 
+# One-shot flag so the "expert modules are skipped" warning fires once per
+# process rather than once per (many) expert linear.
+_EXPERT_SKIP_WARNED = False
+
 
 @dataclass
 class MultiLoRA(PEFT, ModuleMatcher):
@@ -73,6 +77,19 @@ class MultiLoRA(PEFT, ModuleMatcher):
             (match, full_name) = ans
 
             if is_expert_linear(full_name):
+                # MoE expert linears are not supported by the grouped-GEMM
+                # multi-LoRA layer; skipping keeps them from crashing, but on an
+                # MoE model that silently drops the experts (most of the
+                # trainable capacity) from LoRA. Warn once so it isn't invisible.
+                global _EXPERT_SKIP_WARNED
+                if not _EXPERT_SKIP_WARNED:
+                    logger.warning(
+                        "MultiLoRA does not support MoE expert linears; skipping all expert "
+                        "modules (e.g. %s). On MoE models only non-expert (attention/dense) "
+                        "layers will receive LoRA adapters.",
+                        full_name,
+                    )
+                    _EXPERT_SKIP_WARNED = True
                 return module
             if isinstance(module, TopKRouter):
                 return module
