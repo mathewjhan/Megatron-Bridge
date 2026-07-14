@@ -187,6 +187,12 @@ class _RecordingAdapter(nn.Module):
         self.linear_out = nn.Linear(dim, out_features, bias=False)
         self.extra_kwargs = extra_kwargs
 
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        return {
+            f"{prefix}linear_in.weight": ("sharded", self.linear_in.weight),
+            f"{prefix}linear_out.weight": ("sharded", self.linear_out.weight),
+        }
+
 
 def _fake_attrs(module, *args, **kwargs):
     return AdapterAttributes(
@@ -251,6 +257,22 @@ def test_expose_adapter_slot_syncs_export_scaling():
 
     assert layer.adapters[0].alpha == 16
     assert layer.adapters[1].alpha == 16
+
+
+def test_sharded_state_dict_delegates_to_adapter_sharding():
+    layer = _build_cpu_layer(n_adapters=2, dim=8)
+    layer.to_wrap.sharded_state_dict = lambda prefix, sharded_offsets, metadata: {f"{prefix}weight": "base"}
+
+    sharded_sd = layer.sharded_state_dict(prefix="decoder.layers.0.linear_proj.")
+
+    assert sharded_sd["decoder.layers.0.linear_proj.weight"] == "base"
+    for i in range(2):
+        entry = sharded_sd[f"decoder.layers.0.linear_proj.adapters.{i}.linear_in.weight"]
+        assert entry[0] == "sharded"
+        assert entry[1] is layer.adapters[i].linear_in.weight
+        entry = sharded_sd[f"decoder.layers.0.linear_proj.adapters.{i}.linear_out.weight"]
+        assert entry[0] == "sharded"
+        assert entry[1] is layer.adapters[i].linear_out.weight
 
 
 # --------------------------------------------------------------------------- #
