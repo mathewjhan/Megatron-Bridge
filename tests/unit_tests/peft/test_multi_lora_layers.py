@@ -71,6 +71,11 @@ class _FakeMultiLoRALinear(MultiLoRALinear):
     def __init__(self):
         nn.Module.__init__(self)
         self.adapters = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+        for adapter in self.adapters:
+            adapter.alpha = 2.0
+        self.alpha_values = torch.ones(2)
+        self.rank_values = torch.full((2,), 2.0)
+        self.max_rank = 2
 
 
 def test_expose_adapter_slot_restores_on_exception():
@@ -84,6 +89,7 @@ def test_expose_adapter_slot_restores_on_exception():
     # ...and it is fully restored despite the exception
     assert "adapters" in m._modules
     assert "adapter" not in m._modules
+    assert m.adapters[0].alpha == 2.0
 
 
 def test_hide_adapters_restores_on_exception():
@@ -217,6 +223,34 @@ def test_constructor_forwards_wrapped_module_runtime_config():
         assert adapter.extra_kwargs["model_parallel_config"] is base.config
         assert adapter.extra_kwargs["disable_tensor_parallel_comm"] is False
         assert adapter.extra_kwargs["base_linear_is_parallel"] is True
+
+
+def test_slot_metadata_registered_as_buffers():
+    layer = _build_cpu_layer(n_adapters=2, dim=8)
+
+    buffers = dict(layer.named_buffers())
+    assert "alpha_values" in buffers
+    assert "rank_values" in buffers
+
+    layer.to(torch.float64)
+    assert layer.alpha_values.dtype == torch.float64
+    assert layer.rank_values.dtype == torch.float64
+
+
+def test_expose_adapter_slot_syncs_export_scaling():
+    """Exposed .alpha yields the slot's runtime scaling under alpha/dim."""
+    layer = _build_cpu_layer(n_adapters=2, dim=8, alpha=16)
+    layer.init_adapter_slot(0, rank=4, alpha=16)
+
+    with expose_adapter_slot(layer, 0):
+        assert layer.adapter.dim == layer.max_rank
+        assert layer.adapter.alpha == pytest.approx(16 * 8 / 4)
+
+    with expose_adapter_slot(layer, 1):
+        assert layer.adapter.alpha == pytest.approx(1.0)
+
+    assert layer.adapters[0].alpha == 16
+    assert layer.adapters[1].alpha == 16
 
 
 # --------------------------------------------------------------------------- #
