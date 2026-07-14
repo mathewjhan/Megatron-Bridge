@@ -35,6 +35,7 @@ import torch
 import torch.nn as nn
 
 from megatron.bridge.peft import multi_lora as multi_lora_mod
+from megatron.bridge.peft import multi_lora_layers as multi_lora_layers_mod
 from megatron.bridge.peft.multi_lora import MultiLoRA
 from megatron.bridge.peft.multi_lora_layers import (
     MultiLoRALinear,
@@ -42,6 +43,7 @@ from megatron.bridge.peft.multi_lora_layers import (
     hide_adapters,
     load_adapter,
 )
+from megatron.bridge.peft.utils import AdapterAttributes
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +164,59 @@ def test_load_adapter_unused_keys_raises():
     }
     with pytest.raises(KeyError, match="matched no"):
         load_adapter(m, 0, over_full)
+
+
+# --------------------------------------------------------------------------- #
+# Adapter construction wiring (CPU: ParallelLinearAdapter replaced by a fake).
+# --------------------------------------------------------------------------- #
+class _RecordingAdapter(nn.Module):
+    """CPU stand-in for ParallelLinearAdapter; records constructor kwargs."""
+
+    def __init__(self, in_features, out_features, dim, base_linear_name, *, alpha=None, **extra_kwargs):
+        super().__init__()
+        self.dim = dim
+        self.alpha = alpha if alpha is not None else dim
+        self.base_linear_name = base_linear_name
+        self.linear_in = nn.Linear(in_features, dim, bias=False)
+        self.linear_out = nn.Linear(dim, out_features, bias=False)
+        self.extra_kwargs = extra_kwargs
+
+
+def _fake_attrs(module, *args, **kwargs):
+    return AdapterAttributes(
+        input_is_parallel=False,
+        in_features=module.in_features,
+        out_features=module.out_features,
+        disable_tensor_parallel_comm=False,
+        disable_sequence_parallel_comm=True,
+        base_linear_is_parallel=True,
+    )
+
+
+def _build_cpu_layer(n_adapters=2, dim=8, alpha=16, to_wrap=None):
+    with (
+        patch.object(multi_lora_layers_mod, "ParallelLinearAdapter", _RecordingAdapter),
+        patch.object(multi_lora_layers_mod, "get_adapter_attributes_from_linear", _fake_attrs),
+    ):
+        return MultiLoRALinear(
+            to_wrap=to_wrap if to_wrap is not None else nn.Linear(16, 32),
+            n_adapters=n_adapters,
+            dim=dim,
+            alpha=alpha,
+            full_name="linear_proj",
+        )
+
+
+def test_constructor_forwards_wrapped_module_runtime_config():
+    base = nn.Linear(16, 32)
+    base.config = object()
+
+    layer = _build_cpu_layer(to_wrap=base)
+
+    for adapter in layer.adapters:
+        assert adapter.extra_kwargs["model_parallel_config"] is base.config
+        assert adapter.extra_kwargs["disable_tensor_parallel_comm"] is False
+        assert adapter.extra_kwargs["base_linear_is_parallel"] is True
 
 
 # --------------------------------------------------------------------------- #
